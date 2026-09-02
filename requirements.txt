@@ -1,0 +1,3 @@
+# Host-side only, for aq_bridge.py. Nothing here is installed on the ESP32 —
+# the device runs MicroPython and needs no packages beyond its firmware.
+pyserial>=3.0

@@ -1,0 +1,17 @@
+# Logged data. CSVs here are device output, not source; if you do want to
+# commit a sample log, force it:  git add -f examples/sample.csv
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
