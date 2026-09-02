@@ -173,7 +173,8 @@ elapsed_s,PM1.0_ug_m3,PM2.5_ug_m3,PM4.0_ug_m3,PM10_ug_m3,VOC_index,NOx_index
   is unset or absent it says so explicitly rather than letting you discover it
   later.
 - Roughly **64 kB per 35 minutes**, so about 45 hours in 8 MB, split across
-  one file per hour of about 110 kB each.
+  one file per hour of about 110 kB each — less the reserve described below,
+  which stops logging before the filesystem is full.
 - Every file stands alone: its own location, start time, clock provenance and
   `elapsed_s` origin. Rotation happens *before* the sample that triggers it is
   written, so that sample opens the new file rather than being lost or
@@ -194,6 +195,40 @@ since it is correcting the ESP32's RC drift, so the column tracks real elapsed
 time rather than a drifting oscillator. Setting the clock from the dashboard
 mid-run does **not** dislocate the column: the logging epoch moves with the
 correction, so a run that starts before the clock is set stays continuous.
+
+### When the flash fills up
+
+Logging stops by itself while **128 kB is still free**, rather than running the
+filesystem to zero.
+
+The reserve is sized around what is on that filesystem besides data: the
+device's own source. `main.py`, `sen65.py`, `pcf8523.py` and `boot.py` come to
+about 45 kB together, so 128 kB leaves room to rewrite every one of them over
+USB with ~85 kB spare for filesystem metadata and headroom. A flash filled to
+the last byte is one you cannot repair without first deleting data — which is
+the situation the reserve exists to avoid. It costs 1.6% of an 8 MB flash, or
+about 70 minutes of logging out of ~45 hours.
+
+Change `_MIN_FREE_B` in [`main.py`](main.py) to use a different figure. If you
+are on a larger flash, or you never intend to reflash over USB, a smaller
+reserve is perfectly reasonable — 32 kB still covers filesystem metadata
+comfortably.
+
+- Free space is checked **once a minute** while logging, not once a second:
+  `statvfs` has to walk filesystem metadata, and a minute of logging is under
+  2 kB against a 128 kB reserve, so nothing can slip past between checks.
+- **Starting** a log is refused the same way, with the numbers in the reply,
+  so a device that cannot log says so rather than appearing to start.
+- Sampling, the live stream and the dashboard all keep running. Only writing
+  to flash stops.
+- The device card shows free space in amber as it approaches the reserve and
+  red once logging is barred, and the Logging card shows **STOPPED** with the
+  reason rather than an unexplained **IDLE**.
+- If `statvfs` is unavailable the check does nothing: the logger will not stop
+  on an absence of evidence.
+
+Free some space by downloading and deleting log files from the dashboard, and
+logging can start again.
 
 ### Reading the gas indices
 
@@ -369,6 +404,11 @@ The device is streaming but not reading commands. Check that nothing else is
 holding the port (a REPL will swallow the command bytes), and that `main.py`
 is actually running rather than the board sitting at the REPL prompt after a
 Ctrl-C.
+
+**Logging stopped on its own and the card says "storage low".**
+The flash reached the 128 kB reserve. Download what you want to keep and delete
+some log files; logging will start again once there is room. See *When the
+flash fills up*.
 
 **A download fails with "transfer stalled" or "checksum mismatch".**
 Bytes were lost on the way. Nothing was written to disk — press Download

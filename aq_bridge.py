@@ -717,6 +717,7 @@ td:first-child,th:first-child{text-align:left}
 .cfg span:first-child{color:#9ca3af}
 .pill{display:inline-block;padding:2px 9px;border-radius:10px;font-size:12px}
 .pon{background:#065f46;color:#d1fae5}.poff{background:#7f1d1d;color:#fee2e2}
+.pwarn{background:#78350f;color:#fde68a}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(660px,1fr));gap:14px}
 .pl h4{margin:0 0 2px;font-size:13px;color:#d1d5db;font-weight:normal}
 .pl .sub{font-size:11px;color:#6b7280;margin-bottom:4px}
@@ -1291,7 +1292,13 @@ function renderCfg(d) {
     ["RTC time valid", yn(s.rtc_ok, true)],
     ["Backup battery low", yn(s.batt_low, false)],
     ["Files on device", s.files ? s.files.length : "--"],
-    ["Flash free", kb(s.free)],
+    // Free space is the one figure here that stops the logger, so it earns a
+    // colour: amber while the reserve is close, red once logging is barred.
+    ["Flash free", s.free === undefined || s.free === null ? '<span class="dim">--</span>'
+        : '<span class="' + (s.free < s.min_free ? "warn"
+            : s.free < s.min_free * 2 ? "vm" : "ok") + '">' + kb(s.free) + "</span>"
+          + (s.min_free ? ' <span class="dim">of which ' + kb(s.min_free)
+             + " is reserved</span>" : "")],
   ];
   document.getElementById("cfg").innerHTML = rows.map(
     r => "<div><span>" + r[0] + "</span><span>" + r[1] + "</span></div>").join("");
@@ -1302,10 +1309,14 @@ function renderCfg(d) {
                  : s.logging ? "Stop logging" : "Start logging";
   lb.className = s.logging ? "stop" : "go";
   lb.disabled = !live;
+  // A run that ended by itself must say so: an unexplained IDLE looks the
+  // same as one somebody asked for.
+  const stopped = !s.logging && s.stop_reason;
   document.getElementById("lm").innerHTML = s.logging === undefined ? ""
-    : '<span class="pill ' + (s.logging ? "pon" : "poff") + '">'
-      + (s.logging ? "RUNNING" : "IDLE") + "</span>"
-      + (s.logging && s.logfile ? ' <span class="dim">' + s.logfile + "</span>" : "");
+    : '<span class="pill ' + (s.logging ? "pon" : stopped ? "pwarn" : "poff") + '">'
+      + (s.logging ? "RUNNING" : stopped ? "STOPPED" : "IDLE") + "</span>"
+      + (s.logging && s.logfile ? ' <span class="dim">' + s.logfile + "</span>" : "")
+      + (stopped ? ' <span class="warn">' + s.stop_reason + "</span>" : "");
 
   if (!locDirty && s.lat !== undefined) {
     const la = document.getElementById("lat"), lo = document.getElementById("lon");

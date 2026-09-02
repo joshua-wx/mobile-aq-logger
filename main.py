@@ -77,6 +77,15 @@ _KEYS       = ('pm1p0', 'pm2p5', 'pm4p0', 'pm10p0', 'voc', 'nox')
 _CSV_HEADER = 'elapsed_s,PM1.0_ug_m3,PM2.5_ug_m3,PM4.0_ug_m3,PM10_ug_m3,VOC_index,NOx_index\n'
 
 _ROTATE_S    = 3600     # start a new log file this often; 0 disables rotation
+
+# Stop logging while this much of the filesystem is still free. The board's
+# own source lives on that filesystem — main.py, sen65.py, pcf8523.py and
+# boot.py are ~45 kB together — so the reserve is sized to let every one of
+# them be rewritten over USB, with the rest as headroom for filesystem
+# metadata. Filling the flash completely would leave no room to repair the
+# device without first deleting data. Costs ~1.6% of an 8 MB flash.
+_MIN_FREE_B    = 128 * 1024
+_SPACE_CHECK_S = 60     # how often to look at free space while logging
 _RESYNC_S    = 600      # re-read the PCF8523 into the ESP32 clock this often
 _DRIFT_WARN  = 2        # seconds of MCU-vs-RTC drift worth printing
 
@@ -106,6 +115,8 @@ _g = {
     'logging': False,
     'logfile': None,
     'log_t0': None,       # time.time() at the start of the current run
+    'stop_reason': '',    # why logging last stopped, '' if by request
+    'space_at': 0,        # when free space was last checked
     'ts':      '--',
     'lat':     -37.8136,
     'lon':     144.9631,
@@ -220,6 +231,8 @@ def _emit_status():
         'logging':     _g['logging'],
         'logfile':     _g['logfile'] or '',
         'autostart':   _g['autostart'],
+        'stop_reason': _g['stop_reason'],
+        'min_free':    _MIN_FREE_B,
         'rtc_present': _g['rtc'] is not None,
         'rtc_ok':      _g['rtc_ok'],
         'batt_low':    _g['batt_low'],
@@ -351,6 +364,10 @@ def _open_log():
     opened. Every file is self-contained: its own location, start time and
     clock provenance, with elapsed_s counting from zero again.
     """
+    free = _free_bytes()
+    if free is not None and free < _MIN_FREE_B:
+        return None, 'storage low: {} kB free, {} kB reserved'.format(
+            free // 1024, _MIN_FREE_B // 1024)
     # One instant for the name, the header and the elapsed_s origin, kept as
     # whole seconds so that start + elapsed_s is exactly the row's wall clock.
     t0 = int(time.time())
@@ -395,14 +412,19 @@ def _start_logging():
     if fname is None:
         return None, msg
     _g['logging'] = True
+    _g['stop_reason'] = ''
+    _g['space_at'] = time.time()
     print('Logging started:', fname)
     return fname, msg
 
 
-def _stop_logging():
+def _stop_logging(reason=''):
+    """Stop the run. `reason` is empty when a person asked for it."""
     if _g['logging']:
-        print('Logging stopped:', _g['logfile'])
+        print('Logging stopped:', _g['logfile'],
+              '({})'.format(reason) if reason else '')
         _g['logging'] = False
+        _g['stop_reason'] = reason
 
 
 # ---------------------------------------------------------------------------
@@ -670,10 +692,26 @@ async def _sensor_task(sen):
 
         if _g['logging'] and _g['logfile']:
             elapsed = int(time.time()) - (_g['log_t0'] or 0)
+
+            # Stop while there is still room to operate, rather than
+            # discovering the filesystem is full when a write fails.
+            # Checked once a minute, not once a second: statvfs has to
+            # walk filesystem metadata, and a minute of logging is under
+            # 2 kB against a reserve of 128 kB, so nothing can slip past.
+            if time.time() - _g['space_at'] >= _SPACE_CHECK_S:
+                _g['space_at'] = time.time()
+                free = _free_bytes()
+                # No statvfs means no evidence; never stop on a guess.
+                if free is not None and free < _MIN_FREE_B:
+                    print('Storage low: {} kB free, {} kB reserved.'.format(
+                        free // 1024, _MIN_FREE_B // 1024))
+                    _stop_logging('storage low: {} kB free'.format(free // 1024))
+                    _emit_status()
             # Roll over on the hour mark. Done before the row is written,
             # so the sample that trips it becomes row 0 of the new file
-            # rather than being lost or written to both.
-            if _ROTATE_S and elapsed >= _ROTATE_S:
+            # rather than being lost or written to both. Skipped if the
+            # space check above has just ended the run.
+            if _g['logging'] and _ROTATE_S and elapsed >= _ROTATE_S:
                 previous = _g['logfile']
                 fname, why = _open_log()
                 if fname is None:
@@ -681,10 +719,15 @@ async def _sensor_task(sen):
                     # genuinely gone, the append below stops logging.
                     print('Log rotation failed, staying on {}: {}'.format(
                         previous, why))
+                    # Most likely the reserve is gone; re-check at once
+                    # rather than appending for another minute.
+                    _g['space_at'] = 0
                 else:
                     print('Log rotated: {} -> {}'.format(previous, fname))
                     elapsed = int(time.time()) - _g['log_t0']
                     _emit_status()
+        # Re-tested: the space check above may have just ended the run.
+        if _g['logging'] and _g['logfile']:
             line = '{},{},{},{},{},{},{}\n'.format(
                 elapsed,
                 _fmt(m.pm1p0), _fmt(m.pm2p5), _fmt(m.pm4p0), _fmt(m.pm10p0),
@@ -694,10 +737,11 @@ async def _sensor_task(sen):
                 with open(_g['logfile'], 'a') as fh:
                     fh.write(line)
             except OSError as e:
-                # A full or unwritable filesystem stops the log, not the
-                # device: readings keep streaming to the host.
+                # The reserve should make this unreachable, but a full or
+                # unwritable filesystem stops the log, not the device:
+                # readings keep streaming to the host regardless.
                 print('Log write failed, logging stopped:', e)
-                _stop_logging()
+                _stop_logging('write failed: {}'.format(e))
                 _emit_status()
 
 
