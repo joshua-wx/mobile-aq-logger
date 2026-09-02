@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-USB-serial to web bridge for the AQ-logger — a second, display-only dashboard.
+USB-serial to web bridge for the AQ-logger — the device's only interface.
 
-Runs on a host computer, reads the tagged JSON lines main.py streams over
-USB serial, and serves a dashboard at http://127.0.0.1:9876 with four
-sections: configuration (read-only), the live reading table, the last 200
-samples, and 30-minute plots of every variable.
+Runs on a host computer, reads the tagged JSON lines main.py streams over USB
+serial, and serves a dashboard at http://127.0.0.1:9876 that both displays the
+readings and configures the device: location, clock, start/stop logging, and
+downloading or deleting the CSV log files held on the board's flash.
 
-Nothing here can change the device. Logging, location and the clock are set
-from the WiFi dashboard at http://192.168.4.1 — this one only watches.
+The device has no WiFi and no web server of its own. Commands travel back up
+the same serial line as tagged JSON, each carrying an id the device echoes in
+its reply, so a button press can be matched to its answer even though sample
+and status records are interleaved with it. Downloads come back as base64
+chunks that are reassembled and checked here before the browser sees a file.
 
     pip install pyserial
     python3 aq_bridge.py                  # auto-detect the board
@@ -19,8 +22,12 @@ The dashboard defaults to port 9876 rather than 8000, which is heavily
 contested (nginx, Django, python -m http.server). If it is taken anyway the
 bridge steps to the next free port and tells you which one it used.
 
-DTR is asserted on open. On an ESP32-S3's native USB CDC that is how the
-host says "I am listening": with DTR low, MicroPython treats stdout as
+It binds to 127.0.0.1 by default. --host 0.0.0.0 exposes the dashboard to your
+network, and the dashboard can now change the device and delete its files, so
+only do that on a network you trust: there is no authentication.
+
+DTR is asserted on open. On an ESP32-S3's native USB CDC that is how the host
+says "I am listening": with DTR low, MicroPython treats stdout as
 disconnected and truncates it, so records arrive shredded or not at all.
 RTS is left low, which is what an ordinary terminal does and does not reset
 the board. --no-dtr exists for the rare adapter that auto-resets on DTR.
@@ -31,12 +38,16 @@ tty corrupt the stream for both.
 """
 
 import argparse
+import base64
 import errno
 import json
+import os
 import re
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -47,7 +58,8 @@ try:
 except ImportError:
     sys.exit("pyserial is required:  pip install pyserial")
 
-TAG = "AQ1"
+TAG = "AQ1"          # every line the device emits
+CMD_TAG = "AQC"      # every line the bridge sends
 KEYS = ("pm1p0", "pm2p5", "pm4p0", "pm10p0", "voc", "nox")
 NAMES = ("PM1.0", "PM2.5", "PM4.0", "PM10", "VOC", "NOx")
 UNITS = ("µg/m³", "µg/m³", "µg/m³", "µg/m³",
@@ -61,6 +73,40 @@ HISTORY = PLOT_SECONDS * 2
 
 # Espressif USB VIDs plus the usual USB-UART bridges, best guess first.
 _USB_VIDS = (0x303A, 0x10C4, 0x1A86, 0x0403, 0x2341)
+
+# Commands the dashboard may send. Anything else is refused here rather than
+# forwarded, so a stray POST cannot reach the device.
+ALLOWED_COMMANDS = frozenset((
+    "ping", "status", "list", "log_start", "log_stop",
+    "set_loc", "set_clock", "autostart", "delete",
+))
+
+# --- map tiles ------------------------------------------------------------
+# The page asks this bridge for tiles, never OpenStreetMap directly: one place
+# to identify ourselves, one disk cache, and the browser makes no third-party
+# requests. Only the tiles around a saved location are ever fetched — nine or
+# so per location change — and they are reused from disk after that, so a
+# laptop taken into the field keeps showing sites it has already displayed.
+TILE_URL = "https://tile.openstreetmap.org/%d/%d/%d.png"
+TILE_UA = ("aq_bridge.py/1.0 (AQ-logger dashboard; single-user local tool; "
+           "https://www.openstreetmap.org/copyright)")
+TILE_TIMEOUT = 8.0
+TILE_MAX_Z = 19
+TILE_CACHE = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "aq_bridge", "tiles")
+# Two at a time is plenty for a nine-tile view and keeps us well inside the
+# OSM tile usage policy.
+TILE_SEM = threading.Semaphore(2)
+TILE_FETCH = True          # cleared by --no-map
+TILE_FAILED = {}           # (z,x,y) -> when, so a dead network is not hammered
+TILE_FAIL_TTL = 60.0
+TILE_LOCK = threading.Lock()
+
+CMD_TIMEOUT = 5.0        # seconds to wait for an ack
+FILE_TIMEOUT = 300.0     # ceiling on a whole download
+FILE_IDLE = 10.0         # a download with no chunk for this long has stalled
+NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.csv$")
 
 
 class State:
@@ -140,10 +186,176 @@ class State:
                 "plot_seconds": PLOT_SECONDS,
                 "min_plot_seconds": MIN_PLOT_SECONDS,
                 "table_rows": TABLE_ROWS,
+                "map": TILE_FETCH,
             }
 
 
 STATE = State()
+
+
+# ---------------------------------------------------------------------------
+# Command channel
+#
+# The device answers every command with an 'ack' carrying the id it was sent,
+# and streams a download as 'file' records under that same id. Both arrive on
+# the reader thread interleaved with ordinary telemetry, so a request parks on
+# an Event here and the reader hands it its records as they land.
+# ---------------------------------------------------------------------------
+
+class CommandError(Exception):
+    """A command could not be delivered, or the device refused it."""
+
+
+class Pending:
+    def __init__(self, kind):
+        self.kind = kind          # "ack" for a plain command, "file" for a get
+        self.event = threading.Event()
+        self.ack = None
+        self.chunks = {}          # seq -> raw bytes
+        self.eof = None
+        self.last = time.time()   # for the stalled-transfer check
+
+
+class Commander:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pending = {}
+        self.next_id = 1
+        self.ser = None
+        # One transfer at a time: the device refuses a second anyway, and
+        # serialising here gives a better message than its refusal would.
+        self.transfer = threading.Lock()
+
+    # --- called by the reader thread ---------------------------------------
+
+    def attach(self, ser):
+        with self.lock:
+            self.ser = ser
+
+    def detach(self):
+        """Fail every waiter rather than leaving the UI hung on a dead port."""
+        with self.lock:
+            self.ser = None
+            waiters = list(self.pending.values())
+            self.pending.clear()
+        for p in waiters:
+            p.ack = {"ok": False, "msg": "serial disconnected"}
+            p.event.set()
+
+    def on_ack(self, rec):
+        with self.lock:
+            p = self.pending.get(rec.get("id"))
+            if p is None:
+                return          # a reply to a request that already timed out
+            p.ack = rec
+            p.last = time.time()
+            # A 'get' acks first and keeps streaming, so only wake that waiter
+            # if the device refused it outright.
+            if p.kind == "ack" or not rec.get("ok"):
+                p.event.set()
+
+    def on_file(self, rec):
+        with self.lock:
+            p = self.pending.get(rec.get("id"))
+            if p is None:
+                return
+            p.last = time.time()
+            if rec.get("eof"):
+                p.eof = rec
+                p.event.set()
+                return
+            try:
+                p.chunks[int(rec["seq"])] = base64.b64decode(rec["d"])
+            except (KeyError, ValueError, TypeError, base64.binascii.Error):
+                p.eof = {"err": "undecodable chunk"}
+                p.event.set()
+
+    # --- called by HTTP threads --------------------------------------------
+
+    def _open(self, kind):
+        with self.lock:
+            cid = self.next_id
+            self.next_id += 1
+            p = Pending(kind)
+            self.pending[cid] = p
+        return cid, p
+
+    def _close(self, cid):
+        with self.lock:
+            self.pending.pop(cid, None)
+
+    def _write(self, payload):
+        with self.lock:
+            ser = self.ser
+        if ser is None:
+            raise CommandError("device not connected")
+        line = (CMD_TAG + " " + json.dumps(payload) + "\n").encode("utf-8")
+        try:
+            ser.write(line)
+            ser.flush()
+        except (serial.SerialException, OSError) as e:
+            raise CommandError("serial write failed: %s" % e)
+
+    def send(self, cmd, fields=None, timeout=CMD_TIMEOUT):
+        """Send one command and return the device's ack record."""
+        cid, p = self._open("ack")
+        payload = dict(fields or {})
+        payload["cmd"] = cmd
+        payload["id"] = cid
+        try:
+            self._write(payload)
+            if not p.event.wait(timeout):
+                raise CommandError("no reply from the device in %.0f s" % timeout)
+            return p.ack
+        finally:
+            self._close(cid)
+
+    def fetch(self, name):
+        """Pull one CSV off the device and return its bytes.
+
+        Verified against the byte count and checksum the device sends with
+        the last record: a chunk lost to a serial hiccup has to surface as a
+        failed download, not as a CSV that is quietly missing a few rows.
+        """
+        if not self.transfer.acquire(blocking=False):
+            raise CommandError("another download is already running")
+        try:
+            cid, p = self._open("file")
+            try:
+                self._write({"cmd": "get", "id": cid, "name": name, "off": 0})
+                deadline = time.time() + FILE_TIMEOUT
+                while not p.event.wait(0.25):
+                    now = time.time()
+                    if now - p.last > FILE_IDLE:
+                        raise CommandError("transfer stalled after %d chunks"
+                                           % len(p.chunks))
+                    if now > deadline:
+                        raise CommandError("transfer did not finish in %.0f s"
+                                           % FILE_TIMEOUT)
+                if p.ack is not None and not p.ack.get("ok"):
+                    raise CommandError(p.ack.get("msg", "device refused the request"))
+                eof = p.eof or {}
+                if eof.get("err"):
+                    raise CommandError("device read error: %s" % eof["err"])
+
+                seqs = sorted(p.chunks)
+                if seqs != list(range(len(seqs))):
+                    raise CommandError("missing chunk in transfer")
+                data = b"".join(p.chunks[i] for i in seqs)
+                if eof.get("n") is not None and len(data) != eof["n"]:
+                    raise CommandError("size mismatch: got %d bytes, device sent %d"
+                                       % (len(data), eof["n"]))
+                if eof.get("sum") is not None:
+                    if (sum(data) & 0xFFFFFFFF) != eof["sum"]:
+                        raise CommandError("checksum mismatch — transfer corrupted")
+                return data
+            finally:
+                self._close(cid)
+        finally:
+            self.transfer.release()
+
+
+CMD = Commander()
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +432,8 @@ def serial_reader(port_arg, baud, stop, use_dtr=True):
                 STATE.connected = True
                 STATE.port = port
                 STATE.error = ""
+            # Commands go out on this same handle, from the HTTP threads.
+            CMD.attach(ser)
             print("Connected to %s at %d baud" % (port, baud))
 
             while not stop.is_set():
@@ -263,6 +477,10 @@ def serial_reader(port_arg, baud, stop, use_dtr=True):
                     STATE.add_sample(rec)
                 elif kind == "status":
                     STATE.set_status(rec)
+                elif kind == "ack":
+                    CMD.on_ack(rec)
+                elif kind == "file":
+                    CMD.on_file(rec)
 
         except (serial.SerialException, OSError) as e:
             msg = str(e)
@@ -277,6 +495,7 @@ def serial_reader(port_arg, baud, stop, use_dtr=True):
             print("Serial: %s — retrying in 2 s" % msg)
             stop.wait(2.0)
         finally:
+            CMD.detach()
             if ser is not None:
                 try:
                     ser.close()
@@ -284,6 +503,66 @@ def serial_reader(port_arg, baud, stop, use_dtr=True):
                     pass
     with STATE.lock:
         STATE.connected = False
+
+
+# ---------------------------------------------------------------------------
+# Map tiles
+# ---------------------------------------------------------------------------
+
+def tile_path(z, x, y):
+    return os.path.join(TILE_CACHE, str(z), str(x), "%d.png" % y)
+
+
+def get_tile(z, x, y):
+    """Return one PNG from the cache, fetching it once if it is not there.
+
+    None means "no tile available" — offline with nothing cached, or the
+    tile genuinely does not exist. The page draws its grid instead.
+    """
+    path = tile_path(z, x, y)
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        pass
+    if not TILE_FETCH:
+        return None
+
+    key = (z, x, y)
+    with TILE_LOCK:
+        failed_at = TILE_FAILED.get(key)
+        if failed_at is not None and time.time() - failed_at < TILE_FAIL_TTL:
+            return None
+
+    with TILE_SEM:
+        # Another thread may have fetched it while this one queued.
+        try:
+            with open(path, "rb") as fh:
+                return fh.read()
+        except OSError:
+            pass
+        req = urllib.request.Request(TILE_URL % (z, x, y),
+                                     headers={"User-Agent": TILE_UA})
+        try:
+            with urllib.request.urlopen(req, timeout=TILE_TIMEOUT) as r:
+                data = r.read()
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            with TILE_LOCK:
+                TILE_FAILED[key] = time.time()
+            print("Map tile %d/%d/%d unavailable: %s" % (z, x, y, e))
+            return None
+
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".part"
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)     # never leave a half-written tile in the cache
+    except OSError as e:
+        print("Could not cache tile %d/%d/%d: %s" % (z, x, y, e))
+    with TILE_LOCK:
+        TILE_FAILED.pop(key, None)
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -317,8 +596,100 @@ class Handler(BaseHTTPRequestHandler):
                 since = 0
             self._send(200, "application/json",
                        json.dumps(STATE.snapshot(since)))
+        elif url.path == "/api/download":
+            self._download(parse_qs(url.query).get("name", [""])[0])
+        elif url.path.startswith("/api/tile/"):
+            self._tile(url.path[len("/api/tile/"):])
         else:
             self._send(404, "text/plain", "Not found")
+
+    def do_POST(self):
+        # Drain the body first whatever the path: this is a keep-alive
+        # connection, and bytes left unread would be parsed as the next
+        # request line.
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b""
+
+        if urlparse(self.path).path != "/api/cmd":
+            self._send(404, "text/plain", "Not found")
+            return
+        try:
+            req = json.loads(raw or b"{}")
+            if not isinstance(req, dict):
+                raise ValueError("body is not an object")
+        except (ValueError, TypeError) as e:
+            self._json(400, {"ok": False, "msg": "bad request: %s" % e})
+            return
+
+        cmd = req.pop("cmd", None)
+        if cmd not in ALLOWED_COMMANDS:
+            self._json(400, {"ok": False, "msg": "unknown command: %r" % (cmd,)})
+            return
+        try:
+            ack = CMD.send(cmd, req)
+        except CommandError as e:
+            # The device is unreachable or mute; that is not the browser's
+            # fault, so it gets a 503 and the message to display.
+            self._json(503, {"ok": False, "msg": str(e)})
+            return
+        self._json(200, ack if isinstance(ack, dict) else {"ok": False,
+                                                           "msg": "no reply"})
+
+    def _tile(self, spec):
+        m = re.match(r"^(\d{1,2})/(\d{1,7})/(\d{1,7})\.png$", spec)
+        if not m:
+            self._send(404, "text/plain", "Not found")
+            return
+        z, x, y = (int(g) for g in m.groups())
+        if z > TILE_MAX_Z or x >= (1 << z) or y >= (1 << z):
+            self._send(404, "text/plain", "No such tile")
+            return
+        data = get_tile(z, x, y)
+        if data is None:
+            # 404 rather than a placeholder: the page's onerror handler is
+            # what puts up the "map unavailable" note.
+            self._send(404, "text/plain", "Tile unavailable")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=604800")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, code, obj):
+        self._send(code, "application/json", json.dumps(obj))
+
+    def _download(self, name):
+        """Fetch a CSV off the device and hand it straight to the browser.
+
+        The whole file is held in memory first: a log is a few hundred kB at
+        most, and streaming a partial file would mean the browser saving
+        something that failed verification.
+        """
+        if not NAME_RE.match(name):
+            self._send(400, "text/plain", "Invalid filename")
+            return
+        started = time.time()
+        try:
+            data = CMD.fetch(name)
+        except CommandError as e:
+            self._send(503, "text/plain", "Download failed: %s" % e)
+            print("Download of %s failed: %s" % (name, e))
+            return
+        print("Sent %s (%d bytes) in %.1f s"
+              % (name, len(data), time.time() - started))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition",
+                         'attachment; filename="%s"' % name)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
 
 HTML = r"""<!DOCTYPE html>
@@ -326,7 +697,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AQ-logger — USB monitor</title>
+<title>AQ-logger</title>
 <style>
 *{box-sizing:border-box}
 body{font:14px monospace;margin:16px;background:#111827;color:#d1d5db}
@@ -357,16 +728,111 @@ padding:8px 15px;font:inherit;font-size:13px;cursor:pointer;border-radius:0}
 .tab:hover{color:#d1d5db}
 .tab.active{color:#60a5fa;border-bottom-color:#60a5fa}
 .note{font-size:12px;color:#6b7280;margin-top:8px}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:8px}
+.row:first-child{margin-top:0}
+label{display:flex;align-items:center;gap:6px;font-size:13px;color:#9ca3af}
+input[type=text]{background:#111827;color:#e5e7eb;border:1px solid #4b5563;
+padding:5px 8px;border-radius:4px;width:130px;font:inherit;font-size:13px}
+input[type=text]:focus{outline:none;border-color:#60a5fa}
+button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;
+font:inherit;font-size:13px;background:#374151;color:#e5e7eb}
+button:hover:not(:disabled){filter:brightness(1.2)}
+button:disabled{opacity:.4;cursor:not-allowed}
+.go{background:#065f46;color:#d1fae5}.stop{background:#7f1d1d;color:#fee2e2}
+.act{background:#1e3a5f;color:#bfdbfe}
+.dl{background:#1e3a5f;color:#bfdbfe;padding:3px 9px;font-size:11px}
+.rm{background:#450a0a;color:#fca5a5;padding:3px 9px;font-size:11px}
+.fi{display:flex;align-items:center;gap:10px;padding:4px 0;font-size:13px;
+border-bottom:1px solid #374151}
+.fi .nm{flex:1}
+.msg{font-size:12px;color:#9ca3af}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+#map{position:relative;height:240px;margin-top:10px;border-radius:4px;
+overflow:hidden;background-color:#0b1220;
+background-image:linear-gradient(#1f2937 1px,transparent 1px),
+linear-gradient(90deg,#1f2937 1px,transparent 1px);background-size:40px 40px}
+#maptiles{position:absolute;inset:0;filter:brightness(.86) saturate(.9)}
+#maptiles img{position:absolute;width:256px;height:256px;-webkit-user-drag:none}
+#map .mk{position:absolute;left:50%;top:50%;width:18px;height:18px;
+margin:-9px 0 0 -9px;border:2px solid #f87171;border-radius:50%;
+box-shadow:0 0 0 2px rgba(11,18,32,.7),inset 0 0 0 2px rgba(11,18,32,.5)}
+#map .mk::after{content:"";position:absolute;left:50%;top:50%;width:3px;
+height:3px;margin:-1.5px 0 0 -1.5px;background:#f87171;border-radius:50%}
+#map .zm{position:absolute;left:6px;top:6px;display:flex;gap:4px}
+#map .zm button{padding:1px 9px;font-size:14px;line-height:1.4;
+background:rgba(11,18,32,.8);color:#d1d5db}
+#map .attr{position:absolute;right:5px;bottom:4px;font-size:10px;color:#9ca3af;
+background:rgba(11,18,32,.78);padding:1px 6px;border-radius:3px}
+#map .attr a{color:#9ca3af}
 </style>
 </head>
 <body>
-<h1>AQ-logger — USB monitor</h1>
+<h1>AQ-logger</h1>
 <div id="conn" class="dim" style="font-size:12px;margin-bottom:12px">Connecting…</div>
 
 <div class="card">
-<h3>Configuration <span class="dim" style="text-transform:none;letter-spacing:0">(view only)</span></h3>
+<h3>Device</h3>
 <div class="cfg" id="cfg"></div>
-<div class="note" id="cfgnote"></div>
+</div>
+
+<div class="cols">
+<div class="card">
+<h3>Logging</h3>
+<div class="row">
+<button id="lb" onclick="toggleLog()" disabled>Logging…</button>
+<span id="ls" class="msg"></span>
+</div>
+<div class="row"><span id="lm" class="msg"></span></div>
+<div class="row">
+<label title="With this set the device begins a new log by itself on power-up, so it can be deployed with no computer attached">
+<input type="checkbox" id="as" onchange="setAutostart()" disabled>
+start logging automatically at power-up</label>
+<span id="ass" class="msg"></span>
+</div>
+</div>
+
+<div class="card">
+<h3>Clock</h3>
+<div class="row">
+<span id="rtct" class="dim">--</span>
+<span id="rtcd" class="msg"></span>
+</div>
+<div class="row">
+<button class="act" id="csb" onclick="syncClock(false)" disabled>Sync to this computer</button>
+<label title="Sync by itself when the device clock is unset or more than 10 s out">
+<input type="checkbox" id="auto" checked> auto</label>
+<span id="rtcs" class="msg"></span>
+</div>
+<div class="note">The device has no other time source. Its RTC keeps the time
+on a coin cell between sessions.</div>
+</div>
+</div>
+
+<div class="card">
+<h3>Location <span class="dim" style="text-transform:none;letter-spacing:0">written into every log header</span></h3>
+<div class="row">
+<label>Lat <input type="text" id="lat" placeholder="-33.87"></label>
+<label>Lon <input type="text" id="lon" placeholder="151.21"></label>
+<button class="go" id="lsb" onclick="saveLoc()" disabled>Save</button>
+<span id="locs" class="msg"></span>
+</div>
+<div id="map">
+<div id="maptiles"></div>
+<div class="mk" id="mk" hidden></div>
+<div class="zm">
+<button onclick="zoomMap(-1)" title="Zoom out">&minus;</button>
+<button onclick="zoomMap(1)" title="Zoom in">+</button>
+</div>
+<div class="attr">&copy; <a href="https://www.openstreetmap.org/copyright"
+target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors</div>
+</div>
+<div class="note" id="mapmsg"></div>
+</div>
+
+<div class="card">
+<h3>Log files <span class="dim" style="text-transform:none;letter-spacing:0">on the device</span></h3>
+<div id="fl" class="dim">--</div>
+<div class="note" id="dls"></div>
 </div>
 
 <div class="card">
@@ -568,32 +1034,295 @@ function renderConn(d) {
   }
 }
 
+// --- talking to the device ------------------------------------------------
+// Every control goes through one endpoint; the bridge forwards it over serial
+// and hands back the device's own ack, so the message shown is the device's.
+let live = false, locDirty = false, autoSynced = false, fileSig = null;
+let mapEnabled = null;
+
+async function cmd(name, fields) {
+  try {
+    const r = await fetch("/api/cmd", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(Object.assign({cmd: name}, fields || {}))});
+    return await r.json();
+  } catch (e) {
+    return {ok: false, msg: "bridge unreachable"};
+  }
+}
+
+function flash(id, text, hold) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  if (el._t) clearTimeout(el._t);
+  if (hold !== 0) el._t = setTimeout(() => { el.textContent = ""; }, hold || 5000);
+}
+
+async function act(id, name, fields) {
+  flash(id, "working…", 0);
+  const d = await cmd(name, fields);
+  flash(id, (d.ok ? "" : "failed: ") + (d.msg || (d.ok ? "done" : "no reply")));
+  poll();
+  return d;
+}
+
+// --- controls -------------------------------------------------------------
+function toggleLog() {
+  act("ls", status.logging ? "log_stop" : "log_start");
+}
+
+function saveLoc() {
+  const lat = document.getElementById("lat").value.trim();
+  const lon = document.getElementById("lon").value.trim();
+  if (!lat || !lon) { flash("locs", "enter lat and lon first"); return; }
+  if (isNaN(Number(lat)) || isNaN(Number(lon))) {
+    flash("locs", "lat and lon must be numbers"); return;
+  }
+  locDirty = false;
+  act("locs", "set_loc", {lat: Number(lat), lon: Number(lon)});
+}
+
+function setAutostart() {
+  act("ass", "autostart", {on: document.getElementById("as").checked});
+}
+
+for (const id of ["lat", "lon"])
+  document.getElementById(id).addEventListener("input", () => { locDirty = true; });
+
+// --- clock ----------------------------------------------------------------
+// Device time is local wall-clock with no zone, so compare it against a local
+// Date built the same way rather than parsing it as an instant.
+function devDate(s) {
+  if (!s || s.length < 19) return null;
+  const n = (a, b) => Number(s.slice(a, b));
+  const dt = new Date(n(0,4), n(5,7)-1, n(8,10), n(11,13), n(14,16), n(17,19));
+  return isNaN(dt) ? null : dt;
+}
+
+function browserTS() {
+  const n = new Date();
+  return n.getFullYear() + "-" + pad(n.getMonth()+1) + "-" + pad(n.getDate())
+       + "T" + pad(n.getHours()) + ":" + pad(n.getMinutes())
+       + ":" + pad(n.getSeconds());
+}
+
+async function syncClock(auto) {
+  flash("rtcs", "setting…", 0);
+  const d = await cmd("set_clock", {ts: browserTS()});
+  flash("rtcs", (auto ? "auto: " : "") + (d.msg || "no reply"));
+  poll();
+}
+
+function renderClock(s) {
+  const t = document.getElementById("rtct"), w = document.getElementById("rtcd");
+  t.textContent = s.ts || "--";
+  const dev = devDate(s.ts);
+  let msg = "", cls = "dim";
+  if (s.rtc_present === false) { msg = "RTC not detected — check wiring"; cls = "warn"; }
+  else if (s.rtc_ok === false) { msg = "clock not set"; cls = "warn"; }
+  else if (dev) {
+    const drift = Math.round((dev - new Date()) / 1000);
+    msg = drift === 0 ? "in sync" : (drift > 0 ? "+" : "") + drift + " s vs this computer";
+    cls = Math.abs(drift) > 10 ? "warn" : "ok";
+  }
+  if (s.batt_low) { msg += (msg ? " — " : "") + "backup battery low"; cls = "warn"; }
+  w.textContent = msg; w.className = cls;
+
+  // Nothing on the device knows the time on its own, so this computer is the
+  // source of truth: offer it once when the clock is unset or well out.
+  if (live && s.rtc_present && !autoSynced && document.getElementById("auto").checked) {
+    const bad = s.rtc_ok === false
+             || (dev && Math.abs((dev - new Date()) / 1000) > 10);
+    if (bad) { autoSynced = true; syncClock(true); }
+  }
+}
+
+// --- map ------------------------------------------------------------------
+// Slippy-map arithmetic, so a saved lat/lon can be shown without a mapping
+// library: Web Mercator world pixels at zoom z, then a grid of 256 px tiles
+// positioned so the point lands in the middle of the box.
+let mapZoom = 13, mapKey = null, mapMisses = 0;
+try { mapZoom = Number(localStorage.getItem("aq_zoom")) || 13; } catch (e) {}
+
+const lon2px = (lon, z) => (lon + 180) / 360 * Math.pow(2, z) * 256;
+function lat2px(lat, z) {
+  const r = Math.max(-85.05, Math.min(85.05, lat)) * Math.PI / 180;
+  return (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2
+         * Math.pow(2, z) * 256;
+}
+
+// Redrawn only when the location or the zoom actually changes — so on boot,
+// and when Save reports a new position back. Polling never touches it.
+function drawMap(lat, lon, force) {
+  if (lat === undefined || lat === null || lon === undefined || lon === null) return;
+  const box = document.getElementById("map");
+  const W = box.clientWidth, H = box.clientHeight;
+  if (!W || !H) return;                       // card not laid out yet
+  const key = [lat, lon, mapZoom, W, H].join(",");
+  if (!force && key === mapKey) return;
+  mapKey = key;
+  mapMisses = 0;
+
+  const n = Math.pow(2, mapZoom);
+  const left = lon2px(lon, mapZoom) - W / 2, top = lat2px(lat, mapZoom) - H / 2;
+  let html = "";
+  for (let ty = Math.floor(top / 256); ty <= Math.floor((top + H) / 256); ty++) {
+    if (ty < 0 || ty >= n) continue;          // above the pole or below it
+    for (let tx = Math.floor(left / 256); tx <= Math.floor((left + W) / 256); tx++) {
+      const wx = ((tx % n) + n) % n;          // wrap across the antimeridian
+      html += '<img src="/api/tile/' + mapZoom + "/" + wx + "/" + ty + '.png"'
+            + ' style="left:' + Math.round(tx * 256 - left) + "px;top:"
+            + Math.round(ty * 256 - top) + 'px" onerror="tileMissing()" alt="">';
+    }
+  }
+  document.getElementById("maptiles").innerHTML = html;
+  document.getElementById("mk").hidden = false;
+  document.getElementById("mapmsg").textContent =
+    Number(lat).toFixed(6) + ", " + Number(lon).toFixed(6)
+    + "  ·  zoom " + mapZoom;
+}
+
+// One missing tile is a hole in the cache; a boxful means there is no map to
+// be had, and the grid behind them is the fallback.
+function tileMissing() {
+  if (++mapMisses < 2) return;
+  document.getElementById("maptiles").innerHTML = "";
+  const s = status || {};
+  document.getElementById("mapmsg").textContent =
+    (s.lat === undefined ? "" : Number(s.lat).toFixed(6) + ", "
+      + Number(s.lon).toFixed(6) + "  ·  ")
+    + (mapEnabled === false
+        ? "map tiles disabled (--no-map); showing the grid only"
+        : "map tiles unavailable — no connection, and none cached for here");
+}
+
+function zoomMap(d) {
+  mapZoom = Math.max(2, Math.min(18, mapZoom + d));
+  try { localStorage.setItem("aq_zoom", mapZoom); } catch (e) {}
+  const s = status || {};
+  drawMap(s.lat, s.lon, true);
+}
+
+// A resize changes which tiles cover the box; they are already cached, so
+// redrawing costs nothing but is pointless to do on every pixel.
+let mapResize = null;
+window.addEventListener("resize", () => {
+  clearTimeout(mapResize);
+  mapResize = setTimeout(() => {
+    const s = status || {};
+    drawMap(s.lat, s.lon, true);
+  }, 300);
+});
+
+// --- files ----------------------------------------------------------------
+const SAFE_NAME = /^[A-Za-z0-9_.-]+\.csv$/;
+const kb = n => n === undefined || n === null ? "--"
+  : n < 1024 ? n + " B"
+  : n < 1024 * 1024 ? (n / 1024).toFixed(1) + " kB"
+  : (n / 1048576).toFixed(2) + " MB";
+
+function renderFiles(s) {
+  const files = (s.files || []).map(f => Array.isArray(f) ? f : [f, null])
+                               .filter(f => SAFE_NAME.test(f[0]));
+  // Rebuilding this every second would fight the buttons, so only redraw when
+  // the listing actually changes — sizes included, so a growing log updates.
+  const sig = JSON.stringify(files) + "|" + live;
+  if (sig === fileSig) return;
+  fileSig = sig;
+  const el = document.getElementById("fl");
+  if (!files.length) {
+    el.className = "dim";
+    el.textContent = live ? "No log files on the device." : "--";
+    return;
+  }
+  el.className = "";
+  const dis = live ? "" : " disabled";
+  el.innerHTML = files.map(f =>
+    '<div class="fi"><span class="nm">' + f[0] + '</span>'
+    + '<span class="dim">' + kb(f[1]) + '</span>'
+    + '<button class="dl" onclick="dl(\'' + f[0] + '\')"' + dis + '>Download</button>'
+    + '<button class="rm" onclick="del(\'' + f[0] + '\')"' + dis + '>Delete</button>'
+    + '</div>').join("");
+}
+
+// Fetched rather than linked, so a failed transfer shows its reason here
+// instead of the browser saving the error page as a .csv.
+async function dl(name) {
+  flash("dls", "Downloading " + name + " over serial — this takes a few "
+             + "seconds per 100 kB…", 0);
+  try {
+    const r = await fetch("/api/download?name=" + encodeURIComponent(name));
+    if (!r.ok) { flash("dls", "Download failed: " + await r.text(), 15000); return; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    flash("dls", "Saved " + name + " (" + kb(blob.size) + ")", 15000);
+  } catch (e) {
+    flash("dls", "Download failed: " + e, 15000);
+  }
+}
+
+async function del(name) {
+  if (!confirm("Delete " + name + " from the device?\nThis cannot be undone.")) return;
+  fileSig = null;
+  await act("dls", "delete", {name: name});
+}
+
+// --- device panel ---------------------------------------------------------
 function renderCfg(d) {
   const s = d.status || {};
+  live = !!d.connected && s.ts !== undefined;
+
   const yn = (v, good) => v === undefined ? '<span class="dim">--</span>'
       : '<span class="' + (v === good ? "ok" : "warn") + '">' + (v ? "yes" : "no") + '</span>';
   const up = s.up === undefined ? "--"
       : Math.floor(s.up / 3600) + "h " + Math.floor((s.up % 3600) / 60) + "m";
   const rows = [
-    ["Access point", s.ssid ? s.ssid + " @ " + s.ip : "--"],
     ["Device time", s.ts || "--"],
     ["Uptime", up],
     ["Latitude", s.lat === undefined ? "--" : s.lat],
     ["Longitude", s.lon === undefined ? "--" : s.lon],
-    ["Logging", s.logging === undefined ? '<span class="dim">--</span>'
-        : '<span class="pill ' + (s.logging ? "pon" : "poff") + '">'
-          + (s.logging ? "RUNNING" : "IDLE") + "</span>"],
     ["Log file", s.logfile || "--"],
     ["RTC detected", yn(s.rtc_present, true)],
     ["RTC time valid", yn(s.rtc_ok, true)],
     ["Backup battery low", yn(s.batt_low, false)],
     ["Files on device", s.files ? s.files.length : "--"],
+    ["Flash free", kb(s.free)],
   ];
   document.getElementById("cfg").innerHTML = rows.map(
     r => "<div><span>" + r[0] + "</span><span>" + r[1] + "</span></div>").join("");
-  document.getElementById("cfgnote").textContent =
-    "Read-only. Logging, location and the clock are set on the device's own "
-    + "dashboard at http://" + (s.ip || "192.168.4.1") + " over WiFi.";
+
+  // --- controls follow the device, except where the user is mid-edit ------
+  const lb = document.getElementById("lb");
+  lb.textContent = s.logging === undefined ? "Logging…"
+                 : s.logging ? "Stop logging" : "Start logging";
+  lb.className = s.logging ? "stop" : "go";
+  lb.disabled = !live;
+  document.getElementById("lm").innerHTML = s.logging === undefined ? ""
+    : '<span class="pill ' + (s.logging ? "pon" : "poff") + '">'
+      + (s.logging ? "RUNNING" : "IDLE") + "</span>"
+      + (s.logging && s.logfile ? ' <span class="dim">' + s.logfile + "</span>" : "");
+
+  if (!locDirty && s.lat !== undefined) {
+    const la = document.getElementById("lat"), lo = document.getElementById("lon");
+    if (document.activeElement !== la) la.value = s.lat;
+    if (document.activeElement !== lo) lo.value = s.lon;
+  }
+  mapEnabled = d.map;
+  drawMap(s.lat, s.lon);
+  document.getElementById("lsb").disabled = !live;
+  document.getElementById("csb").disabled = !live;
+  const as = document.getElementById("as");
+  as.disabled = !live;
+  if (document.activeElement !== as && s.autostart !== undefined)
+    as.checked = !!s.autostart;
+
+  renderClock(s);
+  renderFiles(s);
 }
 
 function renderTables(d) {
@@ -696,8 +1425,10 @@ def bind_http(host, port, explicit):
     return None, None
 
 def main():
+    global TILE_FETCH, TILE_CACHE
+
     ap = argparse.ArgumentParser(
-        description="Serve a display-only AQ-logger dashboard from USB serial.")
+        description="Serve the AQ-logger dashboard, and configure the device, over USB serial.")
     ap.add_argument("--port", help="serial device (default: auto-detect)")
     ap.add_argument("--baud", type=int, default=115200, help="default: 115200")
     ap.add_argument("--http-port", type=int, default=DEFAULT_HTTP_PORT,
@@ -709,9 +1440,19 @@ def main():
     ap.add_argument("--no-dtr", action="store_true",
                     help="do not assert DTR on open; only for adapters that "
                          "auto-reset on it — an ESP32-S3 needs DTR to send")
+    ap.add_argument("--no-map", action="store_true",
+                    help="never fetch map tiles; the location card falls back "
+                         "to a plain coordinate grid. Cached tiles are still "
+                         "shown")
+    ap.add_argument("--tile-cache", default=TILE_CACHE,
+                    help="where to keep downloaded map tiles (default: %s)"
+                         % TILE_CACHE)
     ap.add_argument("--list", action="store_true",
                     help="list candidate serial ports and exit")
     args = ap.parse_args()
+
+    TILE_FETCH = not args.no_map
+    TILE_CACHE = os.path.expanduser(args.tile_cache)
 
     if args.list:
         print("USB serial ports:")

@@ -1,24 +1,36 @@
 """
-AQ-logger — MicroPython web application for ESP32-S3.
+AQ-logger — MicroPython air-quality logger for ESP32-S3.
 
-Creates a WiFi access point "AQ-logger" (open, no password) and serves a
-dashboard on http://192.168.4.1 that shows live SEN65 readings, lets the
-user start/stop CSV logging, set a GPS location written into the log header,
-and download/delete log files.
+Samples a Sensirion SEN65 once a second, timestamps every row from a
+battery-backed PCF8523 RTC, and appends to a CSV file on the board's flash.
+A new file is started every hour so an unattended run does not produce one
+unbounded file; see _ROTATE_S.
 
-Time comes from a battery-backed PCF8523 RTC. At boot the ESP32's internal
-clock is set from it, timestamps are then taken from the internal clock so
-the shared I2C bus is not hit once per sample, and the internal clock is
-re-synced from the PCF8523 every 10 minutes to stop it drifting. The RTC
-itself is set from the browser via the dashboard.
+There is no WiFi and no web server here. The device's entire interface is a
+line-oriented protocol on the USB serial port: it streams tagged JSON out and
+accepts tagged JSON commands in. aq_bridge.py on a host computer speaks that
+protocol and serves the one dashboard, which both displays readings and
+configures the device — location, clock, start/stop logging, and downloading
+or deleting log files.
 
-The same readings are also streamed over USB serial as tagged JSON lines,
-one per sample, for aq_bridge.py on a host computer to pick up and serve as
-a second, display-only dashboard. See the "Serial stream" section below for
-the wire format. Set _SERIAL_STREAM = False to turn it off.
+Logging does not need the host. Configuration is persisted to config.json, so
+a device set up at the bench keeps its location and, if autostart is enabled,
+begins logging by itself on power-up. Unplugging the host does not interrupt
+a run in progress.
 
-To add a WPA2 password change authmode=0 to authmode=3 and add
-password='yourpassword' in _start_ap().
+Wire format. One record per line, so a reader can use readline() and ignore
+anything it does not recognise:
+
+    out   AQ1 {"t":"data","ts":"...","v":{...},"mx":{...},"mn":{...}}  ~1 Hz
+    out   AQ1 {"t":"status","lat":-37.8,"logging":true,...}       every 5 s
+    out   AQ1 {"t":"ack","id":7,"ok":true,"msg":"started"}      per command
+    out   AQ1 {"t":"file","id":8,"seq":0,"d":"<base64>"}     during download
+    in    AQC {"id":7,"cmd":"log_start"}
+
+Ordinary print() diagnostics share the port; they simply lack the tag.
+
+Never send 0x03 (Ctrl-C) on this port: MicroPython treats it as an interrupt
+and would stop the logger. Commands are plain ASCII JSON lines.
 
 Wiring (I2C bus 0):
     SDA -> GPIO 5
@@ -36,8 +48,18 @@ try:
 except ImportError:
     import ujson as json
 
-import network
+try:
+    import select
+except ImportError:
+    import uselect as select
+
+try:
+    import binascii
+except ImportError:
+    import ubinascii as binascii
+
 import os
+import sys
 import time
 from machine import I2C, Pin, RTC
 
@@ -48,177 +70,30 @@ from sen65 import SEN65
 # Constants
 # ---------------------------------------------------------------------------
 
-_AP_SSID    = 'AQ-logger'
 _KEYS       = ('pm1p0', 'pm2p5', 'pm4p0', 'pm10p0', 'voc', 'nox')
-_CSV_HEADER = 'timestamp,PM1.0_ug_m3,PM2.5_ug_m3,PM4.0_ug_m3,PM10_ug_m3,VOC_index,NOx_index\n'
+# Rows carry seconds elapsed since '# Start:' in the header rather than a
+# full timestamp: at 1 Hz the absolute time was ~40% of every row and is
+# entirely reconstructible from the start time plus the offset.
+_CSV_HEADER = 'elapsed_s,PM1.0_ug_m3,PM2.5_ug_m3,PM4.0_ug_m3,PM10_ug_m3,VOC_index,NOx_index\n'
 
+_ROTATE_S    = 3600     # start a new log file this often; 0 disables rotation
 _RESYNC_S    = 600      # re-read the PCF8523 into the ESP32 clock this often
 _DRIFT_WARN  = 2        # seconds of MCU-vs-RTC drift worth printing
 
 _SERIAL_STREAM   = True   # emit tagged JSON lines on USB serial
-_SERIAL_TAG      = 'AQ1'  # line prefix the host bridge looks for
-_SERIAL_STATUS_S = 5      # seconds between 'status' records
+_SERIAL_TAG      = 'AQ1'  # prefix on every line this device emits
+_CMD_TAG         = 'AQC'  # prefix the host puts on every command
+_SERIAL_STATUS_S = 5      # seconds between unsolicited 'status' records
 
-_HTML = """\
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AQ-logger</title>
-<style>
-*{box-sizing:border-box}
-body{font:14px monospace;margin:16px;background:#111827;color:#d1d5db}
-h1{color:#60a5fa;margin:0 0 4px}
-h3{color:#9ca3af;margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:1px}
-.card{background:#1f2937;border-radius:8px;padding:14px 16px;margin-bottom:12px}
-table{border-collapse:collapse;width:100%}
-th,td{border:1px solid #374151;padding:5px 10px;text-align:right}
-th{background:#111827;color:#9ca3af;font-weight:normal;font-size:12px}
-td:first-child{text-align:left}
-.vl{color:#34d399}.vm{color:#fbbf24}.va{color:#60a5fa}
-.warn{color:#fca5a5}.ok{color:#34d399}.dim{color:#6b7280}
-input{background:#111827;color:#e5e7eb;border:1px solid #4b5563;padding:4px 8px;border-radius:4px;width:130px}
-button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font:inherit;font-size:13px}
-.gs{background:#065f46;color:#d1fae5}.rs{background:#7f1d1d;color:#fee2e2}
-.dl{background:#1e3a5f;color:#bfdbfe;padding:3px 8px;font-size:11px}
-.rm{background:#450a0a;color:#fca5a5;padding:3px 8px;font-size:11px}
-.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:6px}
-#ts{color:#6b7280;font-size:12px;margin-bottom:10px}
-.fi{margin:3px 0;display:flex;align-items:center;gap:6px;font-size:13px}
-</style>
-</head>
-<body>
-<h1>AQ-logger</h1>
-<div id="ts">Connecting...</div>
-<div class="card">
-<h3>Measurements</h3>
-<table>
-<thead><tr><th>Parameter</th><th class="vl">Latest</th><th class="vm">Max</th><th class="va">1-min Mean</th></tr></thead>
-<tbody id="tb"></tbody>
-</table>
-</div>
-<div class="card">
-<h3>Clock</h3>
-<div class="row">
-<span id="rtct" class="dim" style="font-size:13px">--</span>
-<span id="rtcd" style="font-size:12px"></span>
-</div>
-<div class="row" style="margin-top:8px">
-<button style="background:#1e3a5f;color:#bfdbfe" onclick="syncRTC()">Sync RTC to browser time</button>
-<label style="font-size:12px" title="Sync automatically when this page sees the device clock is unset or more than 10 s out"><input type="checkbox" id="auto" checked style="width:auto"> auto</label>
-<span id="rtcs" class="ok" style="font-size:12px"></span>
-</div>
-</div>
-<div class="card">
-<h3>Logging</h3>
-<div class="row">
-<label>Lat <input id="lat" placeholder="-33.87"></label>
-<label>Lon <input id="lon" placeholder="151.21"></label>
-<button style="background:#064e3b;color:#d1fae5" onclick="saveLoc()">Save Location</button>
-<span id="locs" style="color:#34d399;font-size:12px"></span>
-</div>
-<div class="row" style="margin-top:10px">
-<button id="lb" onclick="toggleLog()">Loading...</button>
-<span id="ls" style="color:#6b7280;font-size:12px"></span>
-</div>
-</div>
-<div class="card">
-<h3>Log Files</h3>
-<div id="fl">Loading...</div>
-</div>
-<script>
-const K=["pm1p0","pm2p5","pm4p0","pm10p0","voc","nox"];
-const N=["PM1.0","PM2.5","PM4.0","PM10","VOC","NOx"];
-let logging=false,locSet=false,autoDone=false;
-const f=v=>v==null?"--":Number(v).toFixed(1);
-// Device time is local wall-clock, so build a local Date to compare against.
-function devDate(s){
-if(!s||s.length<19)return null;
-const n=(a,b)=>Number(s.slice(a,b));
-const dt=new Date(n(0,4),n(5,7)-1,n(8,10),n(11,13),n(14,16),n(17,19));
-return isNaN(dt)?null:dt;}
-function browserTS(){
-const n=new Date(),p=v=>String(v).padStart(2,'0');
-return n.getFullYear()+'-'+p(n.getMonth()+1)+'-'+p(n.getDate())+'T'
-+p(n.getHours())+':'+p(n.getMinutes())+':'+p(n.getSeconds());}
-async function poll(){
-try{
-const d=await(await fetch("/data")).json();
-document.getElementById("ts").textContent="Updated: "+d.ts;
-showClock(d);
-document.getElementById("tb").innerHTML=K.map((k,i)=>
-`<tr><td>${N[i]}</td><td class="vl">${f(d.latest[k])}</td><td class="vm">${f(d.max[k])}</td><td class="va">${f(d.mean[k])}</td></tr>`
-).join("");
-logging=d.logging;
-const lb=document.getElementById("lb");
-lb.textContent=logging?"Stop Logging":"Start Logging";
-lb.className=logging?"rs":"gs";
-document.getElementById("ls").textContent=logging?"Logging: "+d.logfile:"Idle";
-if(!locSet&&d.lat!==null){
-document.getElementById("lat").value=d.lat;
-document.getElementById("lon").value=d.lon;
-locSet=true;
-}
-document.getElementById("fl").innerHTML=d.files.length
-?d.files.map(fn=>`<div class="fi"><span>${fn}</span><a href="/dl/${fn}"><button class="dl">Download</button></a><button class="rm" onclick="del('${fn}')">Delete</button></div>`).join("")
-:"<span style='color:#6b7280'>No log files.</span>";
-}catch(e){document.getElementById("ts").textContent="Error: "+e;}
-}
-async function toggleLog(){
-await fetch("/log/"+(logging?"stop":"start"),{method:"POST"});
-poll();
-}
-function showClock(d){
-const t=document.getElementById("rtct"),w=document.getElementById("rtcd");
-t.textContent=d.now||"--";
-const dev=devDate(d.now);
-let msg="",cls="dim";
-if(!d.rtc_present){msg="RTC not detected — check wiring";cls="warn";}
-else if(!d.rtc_ok){msg="clock not set";cls="warn";}
-else if(dev){
-const drift=Math.round((dev-new Date())/1000);
-msg=(drift===0?"in sync":(drift>0?"+":"")+drift+" s vs browser");
-cls=Math.abs(drift)>10?"warn":"ok";
-}
-if(d.batt_low){msg+=(msg?" — ":"")+"backup battery low";cls="warn";}
-w.textContent=msg;w.className=cls;
-// Nothing else on this device knows the time, so the browser is the source
-// of truth: offer it automatically when the clock is unset or well out.
-if(d.rtc_present&&!autoDone&&document.getElementById("auto").checked){
-const bad=!d.rtc_ok||(dev&&Math.abs((dev-new Date())/1000)>10);
-if(bad){autoDone=true;syncRTC(true);}
-}
-}
-async function syncRTC(auto){
-const r=await fetch("/rtc/set",{method:"POST",
-headers:{"Content-Type":"application/x-www-form-urlencoded"},
-body:"ts="+browserTS()});
-const txt=await r.text();
-document.getElementById("rtcs").textContent=(auto?"Auto: ":"")+txt;
-setTimeout(()=>document.getElementById("rtcs").textContent="",4000);
-poll();
-}
-async function saveLoc(){
-const lat=document.getElementById("lat").value.trim();
-const lon=document.getElementById("lon").value.trim();
-if(!lat||!lon){document.getElementById("locs").textContent="Enter lat and lon first";return;}
-const r=await fetch("/location",{method:"POST",
-headers:{"Content-Type":"application/x-www-form-urlencoded"},
-body:"lat="+encodeURIComponent(lat)+"&lon="+encodeURIComponent(lon)});
-document.getElementById("locs").textContent=await r.text();
-setTimeout(()=>document.getElementById("locs").textContent="",3000);
-}
-async function del(fn){
-if(!confirm("Delete "+fn+"?"))return;
-await fetch("/del/"+fn,{method:"POST"});
-poll();
-}
-setInterval(poll,1000);
-poll();
-</script>
-</body>
-</html>"""
+_CONFIG_FILE = 'config.json'
+
+# File download tuning. 512 raw bytes become a ~700-character line; the pause
+# hands the scheduler back to the sensor task between chunks so a download
+# cannot starve sampling, and keeps the USB CDC buffer from backing up into a
+# blocking write.
+_CHUNK        = 512
+_CHUNK_PAUSE  = 4         # ms between chunks
+_CMD_MAX_LINE = 512       # longest command line accepted, then resynchronise
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -230,14 +105,16 @@ _g = {
     'ring':    [],        # last <=60 readings for 1-min mean
     'logging': False,
     'logfile': None,
+    'log_t0': None,       # time.time() at the start of the current run
     'ts':      '--',
     'lat':     -37.8136,
     'lon':     144.9631,
-    'ip':      '0.0.0.0',
+    'autostart': False,   # begin logging at boot without a host attached
     'boot_ms': 0,
     'rtc':     None,      # PCF8523 instance, or None if it did not answer
     'rtc_ok':  False,     # False while the RTC reports a stopped oscillator
     'batt_low': False,
+    'sending': False,     # a file download is in flight
 }
 
 # ---------------------------------------------------------------------------
@@ -247,13 +124,19 @@ _g = {
 def _fmt(v):
     return '' if v is None else '{:.1f}'.format(v)
 
-def _timestamp():
-    """Local wall-clock time as 'YYYY-MM-DD HH:MM:SS' for CSV rows."""
-    y, mo, d, h, mi, s = time.localtime()[:6]
+def _timestamp(t=None):
+    """Local wall-clock time as 'YYYY-MM-DD HH:MM:SS'.
+
+    Takes an optional epoch so a log's header, filename and elapsed_s origin
+    can all be derived from one instant; reading the clock three times risks
+    the second ticking between them, which would put every reconstructed row
+    time out by one.
+    """
+    y, mo, d, h, mi, s = (time.localtime() if t is None else time.localtime(t))[:6]
     return '{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}'.format(y, mo, d, h, mi, s)
 
-def _filename():
-    y, mo, d, h, mi, s = time.localtime()[:6]
+def _filename(t=None):
+    y, mo, d, h, mi, s = (time.localtime() if t is None else time.localtime(t))[:6]
     return '{:04d}{:02d}{:02d}_{:02d}{:02d}{:02d}.csv'.format(y, mo, d, h, mi, s)
 
 def _compute_mean(ring):
@@ -268,46 +151,55 @@ def _compute_mean(ring):
 def _round1(d):
     return {k: (round(v, 1) if v is not None else None) for k, v in d.items()}
 
-def _list_csv():
-    return sorted(f for f in os.listdir() if f.endswith('.csv'))
+def _list_files():
+    """[[name, bytes], ...] for every CSV on flash, oldest name first."""
+    out = []
+    for f in sorted(os.listdir()):
+        if f.endswith('.csv'):
+            try:
+                out.append([f, os.stat(f)[6]])
+            except OSError:
+                pass
+    return out
 
-def _urldecode(s):
-    out, i = [], 0
-    while i < len(s):
-        if s[i] == '%' and i + 2 < len(s):
-            out.append(chr(int(s[i + 1:i + 3], 16)))
-            i += 3
-        elif s[i] == '+':
-            out.append(' ')
-            i += 1
-        else:
-            out.append(s[i])
-            i += 1
-    return ''.join(out)
-
-def _parse_form(body):
-    params = {}
-    for pair in body.decode().split('&'):
-        if '=' in pair:
-            k, v = pair.split('=', 1)
-            params[_urldecode(k)] = _urldecode(v)
-    return params
+def _free_bytes():
+    try:
+        st = os.statvfs('/')
+        return st[0] * st[3]
+    except (OSError, AttributeError):
+        return None
 
 # ---------------------------------------------------------------------------
-# Serial stream
+# Persisted configuration
 #
-# One line per record, so a host can read it with readline() and ignore
-# anything it does not recognise:
-#
-#     AQ1 {"t":"data","ts":"2026-09-02 13:26:45","v":{...},"mx":{...},"mn":{...}}
-#     AQ1 {"t":"status","lat":-37.8,"logging":true,...}
-#
-# 'data' goes out once per sensor sample (~1 Hz) and carries the same
-# latest/max/1-min-mean triple the web dashboard shows. 'status' goes out
-# every _SERIAL_STATUS_S seconds, and immediately whenever the config
-# changes, so the host dashboard is not up to 5 s stale after a button press.
-#
-# Ordinary print() diagnostics share this port; they simply lack the tag.
+# With the WiFi dashboard gone the device cannot be reconfigured in the
+# field, so what was typed in at the bench has to survive a power cycle.
+# ---------------------------------------------------------------------------
+
+def _load_config():
+    try:
+        with open(_CONFIG_FILE) as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return
+    for key in ('lat', 'lon'):
+        v = cfg.get(key)
+        if isinstance(v, (int, float)):
+            _g[key] = float(v)
+    _g['autostart'] = bool(cfg.get('autostart', False))
+
+def _save_config():
+    try:
+        with open(_CONFIG_FILE, 'w') as fh:
+            json.dump({'lat': _g['lat'], 'lon': _g['lon'],
+                       'autostart': _g['autostart']}, fh)
+        return True
+    except OSError as e:
+        print('Config save failed:', e)
+        return False
+
+# ---------------------------------------------------------------------------
+# Serial output
 # ---------------------------------------------------------------------------
 
 def _emit(kind, obj):
@@ -327,14 +219,21 @@ def _emit_status():
         'lon':         _g['lon'],
         'logging':     _g['logging'],
         'logfile':     _g['logfile'] or '',
+        'autostart':   _g['autostart'],
         'rtc_present': _g['rtc'] is not None,
         'rtc_ok':      _g['rtc_ok'],
         'batt_low':    _g['batt_low'],
-        'ssid':        _AP_SSID,
-        'ip':          _g['ip'],
-        'files':       _list_csv(),
+        'files':       _list_files(),
+        'free':        _free_bytes(),
         'up':          time.ticks_diff(time.ticks_ms(), _g['boot_ms']) // 1000,
     })
+
+
+def _ack(cid, ok, msg, data=None):
+    rec = {'id': cid, 'ok': ok, 'msg': msg}
+    if data is not None:
+        rec['data'] = data
+    _emit('ack', rec)
 
 
 async def _status_task():
@@ -352,7 +251,7 @@ def _open_rtc(i2c):
 
     A missing or faulty RTC must not stop the logger: the sensor still runs
     and the dashboard reports the problem, timestamps just start from
-    whatever the ESP32 booted with until someone syncs from a browser.
+    whatever the ESP32 booted with until the host sets the clock.
     """
     try:
         rtc = PCF8523(i2c)
@@ -363,7 +262,7 @@ def _open_rtc(i2c):
     _g['rtc'] = rtc
     if not _sync_mcu_clock(rtc):
         print('WARNING: PCF8523 oscillator stopped - time is not trustworthy.')
-        print('         Open the dashboard and sync the clock to your browser.')
+        print('         Connect the host bridge and sync the clock.')
     if _g['batt_low']:
         print('WARNING: PCF8523 backup battery is low - replace the cell.')
     return rtc
@@ -388,7 +287,15 @@ def _sync_mcu_clock(rtc):
 
 def _set_clock(rtc, dt):
     """Set both the PCF8523 and the ESP32 clock from an 8-tuple."""
+    before = int(time.time())
     RTC().datetime(dt)
+    # Setting the clock redefines the time base — often by years, when the
+    # RTC was unset. Carry the logging epoch along with it so elapsed_s stays
+    # continuous instead of jumping the width of the correction. The periodic
+    # RTC resync is deliberately not compensated: those steps are the drift
+    # correction, and elapsed_s should follow them.
+    if _g['log_t0'] is not None:
+        _g['log_t0'] += int(time.time()) - before
     if rtc is not None:
         rtc.datetime(dt)
         _g['rtc_ok']   = not rtc.lost_power()
@@ -396,10 +303,11 @@ def _set_clock(rtc, dt):
     return _g['rtc_ok']
 
 
-async def _clock_task(rtc):
+async def _clock_task():
     """Pull the ESP32 clock back onto the RTC every _RESYNC_S seconds."""
     while True:
         await asyncio.sleep(_RESYNC_S)
+        rtc = _g['rtc']
         if rtc is None:
             continue
         try:
@@ -413,20 +321,303 @@ async def _clock_task(rtc):
 
 
 # ---------------------------------------------------------------------------
-# WiFi AP
+# Radio
 # ---------------------------------------------------------------------------
 
-def _start_ap():
-    ap = network.WLAN(network.AP_IF)
-    ap.active(True)
-    ap.config(essid=_AP_SSID, authmode=0)   # authmode=0 → open
-    for _ in range(50):
-        if ap.active():
-            break
-        time.sleep(0.1)
-    ip = ap.ifconfig()[0]
-    _g['ip'] = ip
-    print('AP "{}" started | dashboard: http://{}'.format(_AP_SSID, ip))
+def _radio_off():
+    """Shut the WiFi down. Nothing uses it, and this is a battery device.
+
+    The interface state can survive a soft reset, so an AP left running by a
+    previous firmware would otherwise keep drawing current forever.
+    """
+    try:
+        import network
+        for iface in (network.AP_IF, network.STA_IF):
+            w = network.WLAN(iface)
+            if w.active():
+                w.active(False)
+    except Exception as e:
+        print('Could not disable WiFi:', e)
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def _open_log():
+    """Create a new CSV, write its header, and make it the active log.
+
+    Returns (filename, message), or (None, reason) if it could not be
+    opened. Every file is self-contained: its own location, start time and
+    clock provenance, with elapsed_s counting from zero again.
+    """
+    # One instant for the name, the header and the elapsed_s origin, kept as
+    # whole seconds so that start + elapsed_s is exactly the row's wall clock.
+    t0 = int(time.time())
+    fname = _filename(t0)
+    # A stopped RTC hands out the same name on every boot, which would
+    # otherwise silently overwrite the previous run's data.
+    stem, n = fname[:-4], 1
+    while n < 100:
+        try:
+            os.stat(fname)
+        except OSError:
+            break                       # the name is free
+        fname = '{}-{}.csv'.format(stem, n)
+        n += 1
+    try:
+        with open(fname, 'w') as fh:
+            if _g['lat'] is not None:
+                fh.write('# Location: lat={}, lon={}\n'.format(_g['lat'], _g['lon']))
+            fh.write('# Start: {}  (elapsed_s = 0)\n'.format(_timestamp(t0)))
+            # Timestamps are local wall-clock with no timezone, so record
+            # where they came from and whether they can be believed.
+            if _g['rtc'] is None:
+                clock = 'ESP32 internal only, no RTC - times unreliable'
+            elif not _g['rtc_ok']:
+                clock = 'PCF8523 RTC NOT SET - times unreliable'
+            else:
+                clock = 'PCF8523 RTC, local time'
+            fh.write('# Clock: {}\n'.format(clock))
+            fh.write(_CSV_HEADER)
+    except OSError as e:
+        print('Could not open log file:', e)
+        return None, str(e)
+    _g['logfile'] = fname
+    _g['log_t0']  = t0
+    return fname, 'started'
+
+
+def _start_logging():
+    if _g['logging']:
+        return _g['logfile'], 'already logging'
+    fname, msg = _open_log()
+    if fname is None:
+        return None, msg
+    _g['logging'] = True
+    print('Logging started:', fname)
+    return fname, msg
+
+
+def _stop_logging():
+    if _g['logging']:
+        print('Logging stopped:', _g['logfile'])
+        _g['logging'] = False
+
+
+# ---------------------------------------------------------------------------
+# Commands
+#
+# One JSON object per line, tagged so that terminal noise and half-typed
+# input are ignored rather than misread:
+#
+#     AQC {"id":7,"cmd":"log_start"}
+#
+# Every command draws exactly one 'ack' carrying the same id, so the host can
+# match replies to requests even though status and data records are
+# interleaved with them. 'get' acks first and then streams 'file' records.
+# ---------------------------------------------------------------------------
+
+def _cmd_set_loc(c):
+    try:
+        lat = float(c['lat'])
+        lon = float(c['lon'])
+    except (KeyError, TypeError, ValueError):
+        return False, 'invalid lat/lon', None
+    if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+        return False, 'lat/lon out of range', None
+    _g['lat'] = lat
+    _g['lon'] = lon
+    saved = _save_config()
+    return True, 'saved {:.6f}, {:.6f}{}'.format(
+        lat, lon, '' if saved else ' (not persisted)'), None
+
+
+def _cmd_set_clock(c):
+    try:
+        s = c['ts']                    # "2026-06-11T14:30:00"
+        date, t = s.split('T')
+        y, mo, d = date.split('-')
+        h, mi, sec = t.split(':')
+        dt = (int(y), int(mo), int(d), 0, int(h), int(mi), int(sec), 0)
+    except (KeyError, TypeError, ValueError, AttributeError) as e:
+        return False, 'invalid datetime: ' + str(e), None
+
+    try:
+        ok = _set_clock(_g['rtc'], dt)
+    except (OSError, ValueError) as e:
+        return False, 'RTC write failed: ' + str(e), None
+
+    print('Clock set to:', s)
+    if _g['rtc'] is None:
+        return True, 'ESP32 clock set (no RTC): ' + s, None
+    if not ok:
+        return False, 'RTC written but oscillator still stopped - check the battery', None
+    return True, 'clock set: ' + s, None
+
+
+def _cmd_autostart(c):
+    _g['autostart'] = bool(c.get('on'))
+    saved = _save_config()
+    return (saved,
+            'autostart {}{}'.format('on' if _g['autostart'] else 'off',
+                                    '' if saved else ' (not persisted)'),
+            None)
+
+
+def _cmd_delete(c):
+    name = c.get('name')
+    if not isinstance(name, str) or '/' in name or not name.endswith('.csv'):
+        return False, 'invalid filename', None
+    if _g['logging'] and _g['logfile'] == name:
+        return False, 'cannot delete the active log file', None
+    try:
+        os.remove(name)
+    except OSError:
+        return False, 'not found', None
+    print('Deleted:', name)
+    return True, 'deleted ' + name, None
+
+
+async def _send_file(cid, c):
+    """Stream one CSV back as base64 'file' records, then an eof record.
+
+    The host verifies what arrived against the byte count and checksum in
+    the eof record, so a chunk lost to a serial hiccup is detected rather
+    than silently producing a short file. 'off' lets it resume instead of
+    starting the whole transfer again.
+    """
+    name = c.get('name')
+    if not isinstance(name, str) or '/' in name or not name.endswith('.csv'):
+        _ack(cid, False, 'invalid filename')
+        return
+    try:
+        off = int(c.get('off', 0))
+    except (TypeError, ValueError):
+        off = 0
+    try:
+        size = os.stat(name)[6]
+    except OSError:
+        _ack(cid, False, 'not found')
+        return
+    if _g['sending']:
+        _ack(cid, False, 'another download is in progress')
+        return
+
+    _g['sending'] = True
+    _ack(cid, True, 'sending', {'name': name, 'size': size, 'off': off})
+    total = 0
+    csum  = 0
+    seq   = 0
+    try:
+        with open(name, 'rb') as fh:
+            if off:
+                fh.seek(off)
+            while True:
+                chunk = fh.read(_CHUNK)
+                if not chunk:
+                    break
+                csum   = (csum + sum(chunk)) & 0xFFFFFFFF
+                total += len(chunk)
+                _emit('file', {
+                    'id':  cid,
+                    'seq': seq,
+                    'd':   binascii.b2a_base64(chunk).decode().strip(),
+                })
+                seq += 1
+                await asyncio.sleep_ms(_CHUNK_PAUSE)
+    except OSError as e:
+        _emit('file', {'id': cid, 'eof': True, 'err': str(e),
+                       'n': total, 'sum': csum})
+        return
+    finally:
+        _g['sending'] = False
+    _emit('file', {'id': cid, 'eof': True, 'n': total, 'sum': csum})
+
+
+async def _handle_command(line):
+    """Dispatch one already-untagged JSON command line."""
+    try:
+        c = json.loads(line)
+    except ValueError:
+        _emit('ack', {'id': None, 'ok': False, 'msg': 'malformed JSON'})
+        return
+    if not isinstance(c, dict):
+        _emit('ack', {'id': None, 'ok': False, 'msg': 'not an object'})
+        return
+
+    cid  = c.get('id')
+    name = c.get('cmd')
+
+    if name == 'get':
+        await _send_file(cid, c)
+        return
+
+    if name == 'ping':
+        ok, msg, data = True, 'pong', None
+    elif name == 'status':
+        ok, msg, data = True, 'status', None
+    elif name == 'log_start':
+        fname, msg = _start_logging()
+        ok, data = fname is not None, {'logfile': fname} if fname else None
+    elif name == 'log_stop':
+        _stop_logging()
+        ok, msg, data = True, 'stopped', None
+    elif name == 'set_loc':
+        ok, msg, data = _cmd_set_loc(c)
+    elif name == 'set_clock':
+        ok, msg, data = _cmd_set_clock(c)
+    elif name == 'autostart':
+        ok, msg, data = _cmd_autostart(c)
+    elif name == 'list':
+        ok, msg, data = True, 'files', {'files': _list_files()}
+    elif name == 'delete':
+        ok, msg, data = _cmd_delete(c)
+    else:
+        _ack(cid, False, 'unknown command: {}'.format(name))
+        return
+
+    _ack(cid, ok, msg, data)
+    # Every command either changes configuration or is a request to see it,
+    # so refresh the host immediately rather than up to 5 s later.
+    _emit_status()
+
+
+async def _command_task():
+    """Read tagged command lines from USB serial without ever blocking.
+
+    sys.stdin.read() would stall the whole scheduler until a byte arrived,
+    so poll first and only read what is already buffered.
+    """
+    poller = select.poll()
+    poller.register(sys.stdin, select.POLLIN)
+    buf = []
+    while True:
+        lines = []
+        # Cap the work per pass: a host that floods the port must not be able
+        # to keep this loop from yielding to the sensor task.
+        for _ in range(256):
+            if not poller.poll(0):
+                break
+            ch = sys.stdin.read(1)
+            if not ch:
+                break
+            if ch == '\n':
+                lines.append(''.join(buf))
+                buf = []
+            elif ch != '\r':
+                buf.append(ch)
+                if len(buf) > _CMD_MAX_LINE:
+                    buf = []        # runaway line: drop it and resynchronise
+        for line in lines:
+            line = line.strip()
+            if line.startswith(_CMD_TAG):
+                try:
+                    await _handle_command(line[len(_CMD_TAG):].strip())
+                except Exception as e:
+                    print('Command failed:', e)
+        await asyncio.sleep_ms(20)
+
 
 # ---------------------------------------------------------------------------
 # Sensor task
@@ -478,234 +669,37 @@ async def _sensor_task(sen):
         })
 
         if _g['logging'] and _g['logfile']:
+            elapsed = int(time.time()) - (_g['log_t0'] or 0)
+            # Roll over on the hour mark. Done before the row is written,
+            # so the sample that trips it becomes row 0 of the new file
+            # rather than being lost or written to both.
+            if _ROTATE_S and elapsed >= _ROTATE_S:
+                previous = _g['logfile']
+                fname, why = _open_log()
+                if fname is None:
+                    # Stay on the current file; if the filesystem is
+                    # genuinely gone, the append below stops logging.
+                    print('Log rotation failed, staying on {}: {}'.format(
+                        previous, why))
+                else:
+                    print('Log rotated: {} -> {}'.format(previous, fname))
+                    elapsed = int(time.time()) - _g['log_t0']
+                    _emit_status()
             line = '{},{},{},{},{},{},{}\n'.format(
-                ts,
+                elapsed,
                 _fmt(m.pm1p0), _fmt(m.pm2p5), _fmt(m.pm4p0), _fmt(m.pm10p0),
                 _fmt(m.voc_index), _fmt(m.nox_index),
             )
-            with open(_g['logfile'], 'a') as fh:
-                fh.write(line)
-
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
-
-_STATUS = {200: 'OK', 400: 'Bad Request', 404: 'Not Found'}
-
-def _build(status, ctype, body):
-    if isinstance(body, str):
-        body = body.encode('utf-8')
-    hdr = (
-        'HTTP/1.0 {} {}\r\n'
-        'Content-Type: {}; charset=utf-8\r\n'
-        'Content-Length: {}\r\n'
-        'Connection: close\r\n\r\n'
-    ).format(status, _STATUS.get(status, ''), ctype, len(body))
-    return hdr.encode('utf-8') + body
-
-def _ok(text):
-    return _build(200, 'text/plain', text)
-
-def _ok_json(obj):
-    return _build(200, 'application/json', json.dumps(obj))
-
-def _err(status, msg):
-    return _build(status, 'text/plain', msg)
-
-# ---------------------------------------------------------------------------
-# Route handlers
-# ---------------------------------------------------------------------------
-
-def _route_data():
-    return _ok_json({
-        'ts':      _g['ts'],
-        'latest':  _round1(_g['latest']),
-        'max':     _round1(_g['max']),
-        'mean':    _compute_mean(_g['ring']),
-        'logging': _g['logging'],
-        'logfile': _g['logfile'] or '',
-        'files':   _list_csv(),
-        'lat':     _g['lat'],
-        'lon':     _g['lon'],
-        'now':         _timestamp(),
-        'rtc_present': _g['rtc'] is not None,
-        'rtc_ok':      _g['rtc_ok'],
-        'batt_low':    _g['batt_low'],
-    })
-
-def _route_log_start():
-    if not _g['logging']:
-        fname = _filename()
-        _g['logfile'] = fname
-        _g['logging'] = True
-        with open(fname, 'w') as fh:
-            if _g['lat'] is not None:
-                fh.write('# Location: lat={}, lon={}\n'.format(_g['lat'], _g['lon']))
-            fh.write('# Start: {}\n'.format(_timestamp()))
-            # Timestamps are local wall-clock with no timezone, so record
-            # where they came from and whether they can be believed.
-            if _g['rtc'] is None:
-                clock = 'ESP32 internal only, no RTC - times unreliable'
-            elif not _g['rtc_ok']:
-                clock = 'PCF8523 RTC NOT SET - times unreliable'
-            else:
-                clock = 'PCF8523 RTC, local time'
-            fh.write('# Clock: {}\n'.format(clock))
-            fh.write(_CSV_HEADER)
-        print('Logging started:', fname)
-        _emit_status()
-    return _ok('started')
-
-def _route_log_stop():
-    if _g['logging']:
-        print('Logging stopped:', _g['logfile'])
-        _g['logging'] = False
-        _emit_status()
-    return _ok('stopped')
-
-def _route_set_rtc(body, rtc):
-    params = _parse_form(body)
-    try:
-        s = params['ts']               # "2026-06-11T14:30:00"
-        date, t = s.split('T')
-        y, mo, d = date.split('-')
-        h, mi, sec = t.split(':')
-        dt = (int(y), int(mo), int(d), 0, int(h), int(mi), int(sec), 0)
-    except (KeyError, ValueError) as e:
-        return _err(400, 'Invalid datetime: ' + str(e))
-
-    try:
-        ok = _set_clock(rtc, dt)
-    except (OSError, ValueError) as e:
-        return _err(400, 'RTC write failed: ' + str(e))
-
-    print('Clock set to:', s)
-    _emit_status()
-    if rtc is None:
-        return _ok('ESP32 clock set (no RTC): ' + s)
-    if not ok:
-        return _err(400, 'RTC written but oscillator still stopped - check the battery')
-    return _ok('Clock set: ' + s)
-
-def _route_set_location(body):
-    params = _parse_form(body)
-    try:
-        lat = float(params['lat'])
-        lon = float(params['lon'])
-    except (KeyError, ValueError):
-        return _err(400, 'Invalid lat/lon')
-    _g['lat'] = lat
-    _g['lon'] = lon
-    _emit_status()
-    return _ok('Saved: {:.6f}, {:.6f}'.format(lat, lon))
-
-def _route_delete(fname):
-    if '/' in fname or not fname.endswith('.csv'):
-        return _err(400, 'Invalid filename')
-    if _g['logging'] and _g['logfile'] == fname:
-        return _err(400, 'Cannot delete the active log file')
-    try:
-        os.remove(fname)
-        print('Deleted:', fname)
-        _emit_status()
-        return _ok('deleted')
-    except OSError:
-        return _err(404, 'Not found')
-
-# ---------------------------------------------------------------------------
-# HTTP client handler
-# ---------------------------------------------------------------------------
-
-async def _handle_client(reader, writer, rtc):
-    try:
-        req_line = await reader.readline()
-        parts    = req_line.decode().split()
-        if len(parts) < 2:
-            return
-        method, path = parts[0], parts[1]
-
-        content_length = 0
-        while True:
-            h = await reader.readline()
-            if h in (b'\r\n', b''):
-                break
-            hl = h.lower()
-            if hl.startswith(b'content-length:'):
-                try:
-                    content_length = int(hl.split(b':', 1)[1].strip())
-                except ValueError:
-                    pass
-
-        body = b''
-        if content_length > 0:
-            body = await reader.read(content_length)
-
-        # --- route dispatch -------------------------------------------------
-        if method == 'GET' and path == '/':
-            resp = _build(200, 'text/html', _HTML)
-
-        elif method == 'GET' and path == '/data':
-            resp = _route_data()
-
-        elif method == 'POST' and path == '/log/start':
-            resp = _route_log_start()
-
-        elif method == 'POST' and path == '/log/stop':
-            resp = _route_log_stop()
-
-        elif method == 'POST' and path == '/rtc/set':
-            resp = _route_set_rtc(body, rtc)
-
-        elif method == 'POST' and path == '/location':
-            resp = _route_set_location(body)
-
-        elif method == 'POST' and path.startswith('/del/'):
-            resp = _route_delete(path[5:])
-
-        elif method == 'GET' and path.startswith('/dl/'):
-            fname = path[4:]
-            if '/' in fname or not fname.endswith('.csv'):
-                resp = _err(400, 'Invalid filename')
-                writer.write(resp)
-                await writer.drain()
-                return
             try:
-                size = os.stat(fname)[6]
-                hdr  = (
-                    'HTTP/1.0 200 OK\r\n'
-                    'Content-Type: text/csv\r\n'
-                    'Content-Length: {}\r\n'
-                    'Content-Disposition: attachment; filename="{}"\r\n'
-                    'Connection: close\r\n\r\n'
-                ).format(size, fname).encode()
-                writer.write(hdr)
-                await writer.drain()
-                with open(fname, 'r') as fh:
-                    while True:
-                        chunk = fh.read(512)
-                        if not chunk:
-                            break
-                        writer.write(chunk.encode('utf-8'))
-                        await writer.drain()
-            except OSError:
-                writer.write(_err(404, 'Not found'))
-                await writer.drain()
-            return
+                with open(_g['logfile'], 'a') as fh:
+                    fh.write(line)
+            except OSError as e:
+                # A full or unwritable filesystem stops the log, not the
+                # device: readings keep streaming to the host.
+                print('Log write failed, logging stopped:', e)
+                _stop_logging()
+                _emit_status()
 
-        else:
-            resp = _err(404, 'Not found')
-
-        writer.write(resp)
-        await writer.drain()
-
-    except Exception as e:
-        print('Request error:', e)
-    finally:
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -714,22 +708,25 @@ async def _handle_client(reader, writer, rtc):
 async def _main():
     _g['boot_ms'] = time.ticks_ms()
 
+    _radio_off()
+    _load_config()
+
     i2c = I2C(0, scl=Pin(6), sda=Pin(5), freq=100_000)
-    rtc = _open_rtc(i2c)
+    _open_rtc(i2c)
     sen = SEN65(i2c)
 
     print('Clock:', _timestamp())
+    print('Location: lat={}, lon={}'.format(_g['lat'], _g['lon']))
 
-    _start_ap()
+    if _g['autostart']:
+        _start_logging()
+
     asyncio.create_task(_sensor_task(sen))
-    asyncio.create_task(_clock_task(rtc))
+    asyncio.create_task(_clock_task())
     asyncio.create_task(_status_task())
+    asyncio.create_task(_command_task())
 
-    async def _cb(r, w):
-        await _handle_client(r, w, rtc)
-
-    await asyncio.start_server(_cb, '0.0.0.0', 80)
-    print('Web server ready.')
+    print('Ready. Run aq_bridge.py on a host to view and configure.')
 
     while True:
         await asyncio.sleep(3600)
