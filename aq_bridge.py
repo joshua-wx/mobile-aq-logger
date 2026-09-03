@@ -40,6 +40,7 @@ tty corrupt the stream for both.
 import argparse
 import base64
 import errno
+import io
 import json
 import os
 import re
@@ -48,6 +49,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -187,10 +189,63 @@ class State:
                 "min_plot_seconds": MIN_PLOT_SECONDS,
                 "table_rows": TABLE_ROWS,
                 "map": TILE_FETCH,
+                "archive": ARCHIVE.snapshot(),
             }
 
 
 STATE = State()
+
+
+class Archive:
+    """Progress of a "download all" run.
+
+    Pulling every log off the flash is minutes of serial transfer, so the
+    page has to see it advancing rather than sitting on a dead-looking
+    button; the state poll it already makes every second carries this.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.busy = False
+        self.total = 0
+        self.done = 0
+        self.name = ""
+
+    def start(self):
+        """Claim the archiver, or return False if a run is already going.
+
+        Claimed before the listing is asked for, not after: while a transfer
+        is running the device is busy streaming chunks and lets an ordinary
+        command time out, so a second run has to be turned away here to be
+        turned away with the real reason.
+        """
+        with self.lock:
+            if self.busy:
+                return False
+            self.busy, self.total, self.done, self.name = True, 0, 0, ""
+            return True
+
+    def plan(self, total):
+        """How many files the run turned out to be, once the device says."""
+        with self.lock:
+            self.total = total
+
+    def step(self, done, name):
+        with self.lock:
+            self.done, self.name = done, name
+
+    def finish(self):
+        with self.lock:
+            self.busy = False
+
+    def snapshot(self):
+        with self.lock:
+            if not self.busy:
+                return None
+            return {"total": self.total, "done": self.done, "name": self.name}
+
+
+ARCHIVE = Archive()
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +653,8 @@ class Handler(BaseHTTPRequestHandler):
                        json.dumps(STATE.snapshot(since)))
         elif url.path == "/api/download":
             self._download(parse_qs(url.query).get("name", [""])[0])
+        elif url.path == "/api/download-all":
+            self._download_all()
         elif url.path.startswith("/api/tile/"):
             self._tile(url.path[len("/api/tile/"):])
         else:
@@ -690,6 +747,91 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
+
+    def _download_all(self):
+        """Zip every CSV on the device and hand the archive to the browser.
+
+        The listing is asked of the device rather than taken from the last
+        status record, so a file created since that record is not left
+        behind. A file that will not transfer is left out of the archive and
+        named in MISSING.txt instead of aborting the run: on a link this slow,
+        throwing away twenty good minutes because the last file stalled is the
+        worse failure, and a download that quietly came up short is why the
+        omission is written into the zip as well as reported here.
+        """
+        if not ARCHIVE.start():
+            self._send(409, "text/plain",
+                       "A download of every file is already running")
+            return
+        started = time.time()
+        try:
+            names, failed, body = self._archive()
+        except CommandError as e:
+            self._send(503, "text/plain", "Download failed: %s" % e)
+            return
+        finally:
+            ARCHIVE.finish()
+        if names is None:
+            self._send(404, "text/plain", "No log files on the device")
+            return
+        if len(failed) == len(names):
+            self._send(503, "text/plain",
+                       "Download failed, nothing transferred:\n"
+                       + "\n".join(failed))
+            return
+        fname = "aq-logs-%s.zip" % time.strftime("%Y%m%d-%H%M%S")
+        print("Sent %s (%d of %d files, %d bytes) in %.1f s"
+              % (fname, len(names) - len(failed), len(names), len(body),
+                 time.time() - started))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition",
+                         'attachment; filename="%s"' % fname)
+        # Counts rather than a body the browser cannot see past the download,
+        # so the page can say what it actually saved.
+        self.send_header("X-Archived-Files", str(len(names) - len(failed)))
+        self.send_header("X-Failed-Files", str(len(failed)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _archive(self):
+        """Pull every log and return (names, failures, zip bytes).
+
+        (None, ...) if the device has nothing to send. Runs with the archiver
+        already claimed, so it may talk to the device freely.
+        """
+        ack = CMD.send("list")
+        if not isinstance(ack, dict) or not ack.get("ok"):
+            raise CommandError((ack or {}).get("msg")
+                               or "the device would not list its files")
+        listing = (ack.get("data") or {}).get("files") or []
+        names = [f[0] if isinstance(f, (list, tuple)) and f else f for f in listing]
+        names = [n for n in names if isinstance(n, str) and NAME_RE.match(n)]
+        if not names:
+            return None, [], b""
+        ARCHIVE.plan(len(names))
+
+        buf = io.BytesIO()
+        failed = []
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, name in enumerate(names):
+                ARCHIVE.step(i, name)
+                try:
+                    data = CMD.fetch(name)
+                except CommandError as e:
+                    failed.append("%s: %s" % (name, e))
+                    print("Skipped %s: %s" % (name, e))
+                    continue
+                zf.writestr(name, data)
+                print("Archived %s (%d bytes)" % (name, len(data)))
+            ARCHIVE.step(len(names), "")         # the page shows "packing" now
+            if failed:
+                zf.writestr("MISSING.txt",
+                            "These logs would not transfer and are NOT in "
+                            "this archive:\n\n" + "\n".join(failed) + "\n")
+        return names, failed, buf.getvalue()
 
 
 HTML = r"""<!DOCTYPE html>
@@ -833,6 +975,10 @@ target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors</div>
 <div class="card">
 <h3>Log files <span class="dim" style="text-transform:none;letter-spacing:0">on the device</span></h3>
 <div id="fl" class="dim">--</div>
+<div class="row">
+<button id="dla" class="act" onclick="dlAll()" disabled>Download all</button>
+<span class="dim" style="font-size:12px">every log on the device, as one .zip</span>
+</div>
 <div class="note" id="dls"></div>
 </div>
 
@@ -1039,6 +1185,7 @@ function renderConn(d) {
 // Every control goes through one endpoint; the bridge forwards it over serial
 // and hands back the device's own ack, so the message shown is the device's.
 let live = false, locDirty = false, autoSynced = false, fileSig = null;
+let archiving = false;      // some tab is pulling every file off the device
 let mapEnabled = null;
 
 async function cmd(name, fields) {
@@ -1228,7 +1375,11 @@ function renderFiles(s) {
                                .filter(f => SAFE_NAME.test(f[0]));
   // Rebuilding this every second would fight the buttons, so only redraw when
   // the listing actually changes — sizes included, so a growing log updates.
-  const sig = JSON.stringify(files) + "|" + live;
+  // A per-file transfer during a "download all" would only be refused by
+  // the bridge, so those buttons go with it.
+  const ready = live && !archiving;
+  document.getElementById("dla").disabled = !ready || !files.length;
+  const sig = JSON.stringify(files) + "|" + ready;
   if (sig === fileSig) return;
   fileSig = sig;
   const el = document.getElementById("fl");
@@ -1238,7 +1389,7 @@ function renderFiles(s) {
     return;
   }
   el.className = "";
-  const dis = live ? "" : " disabled";
+  const dis = ready ? "" : " disabled";
   el.innerHTML = files.map(f =>
     '<div class="fi"><span class="nm">' + f[0] + '</span>'
     + '<span class="dim">' + kb(f[1]) + '</span>'
@@ -1256,14 +1407,46 @@ async function dl(name) {
     const r = await fetch("/api/download?name=" + encodeURIComponent(name));
     if (!r.ok) { flash("dls", "Download failed: " + await r.text(), 15000); return; }
     const blob = await r.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = name;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    save(blob, name);
     flash("dls", "Saved " + name + " (" + kb(blob.size) + ")", 15000);
   } catch (e) {
     flash("dls", "Download failed: " + e, 15000);
+  }
+}
+
+function save(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+// One zip built by the bridge rather than a file at a time: the browser saves
+// once instead of tripping its own "allow multiple downloads?" guard, and the
+// archive can carry a note about anything that would not come across.
+async function dlAll() {
+  const btn = document.getElementById("dla");
+  if (btn.disabled) return;
+  btn.disabled = true;                        // until the next poll re-renders
+  flash("dls", "Fetching every log over serial — this can take a few minutes…", 0);
+  try {
+    const r = await fetch("/api/download-all");
+    if (!r.ok) { flash("dls", "Download failed: " + await r.text(), 20000); return; }
+    const blob = await r.blob();
+    const cd = (r.headers.get("Content-Disposition") || "").match(/filename="([^"]+)"/);
+    const name = cd ? cd[1] : "aq-logs.zip";
+    save(blob, name);
+    const bad = Number(r.headers.get("X-Failed-Files") || 0);
+    flash("dls", "Saved " + name + " — "
+        + r.headers.get("X-Archived-Files") + " file(s), " + kb(blob.size)
+        + (bad ? ". " + bad + " would not transfer; see MISSING.txt in the zip "
+                 + "and try those on their own." : ""), 30000);
+  } catch (e) {
+    flash("dls", "Download failed: " + e, 20000);
+  } finally {
+    fileSig = null;
+    poll();
   }
 }
 
@@ -1308,7 +1491,10 @@ function renderCfg(d) {
   lb.textContent = s.logging === undefined ? "Logging…"
                  : s.logging ? "Stop logging" : "Start logging";
   lb.className = s.logging ? "stop" : "go";
-  lb.disabled = !live;
+  // The device streams chunks flat out during a transfer and lets an ordinary
+  // command time out, so the controls wait for the archive rather than
+  // failing with a timeout that reads like a fault.
+  lb.disabled = !live || archiving;
   // A run that ended by itself must say so: an unexplained IDLE looks the
   // same as one somebody asked for.
   const stopped = !s.logging && s.stop_reason;
@@ -1325,10 +1511,10 @@ function renderCfg(d) {
   }
   mapEnabled = d.map;
   drawMap(s.lat, s.lon);
-  document.getElementById("lsb").disabled = !live;
-  document.getElementById("csb").disabled = !live;
+  document.getElementById("lsb").disabled = !live || archiving;
+  document.getElementById("csb").disabled = !live || archiving;
   const as = document.getElementById("as");
-  as.disabled = !live;
+  as.disabled = !live || archiving;
   if (document.activeElement !== as && s.autostart !== undefined)
     as.checked = !!s.autostart;
 
@@ -1360,6 +1546,18 @@ function renderTables(d) {
     + "</tbody></table>";
 }
 
+// Held at a few seconds rather than pinned: a poll still in flight when the
+// run ends would otherwise leave a stale line sitting over the result.
+function renderArchive(a) {
+  archiving = !!a;
+  if (!a) return;
+  flash("dls", !a.total ? "Asking the device what it is holding…"
+    : a.name
+    ? "Downloading " + Math.min(a.done + 1, a.total) + " of " + a.total
+      + " — " + a.name + "…"
+    : "Packing " + a.total + " file(s) into a zip…", 3000);
+}
+
 async function poll() {
   try {
     const d = await (await fetch("/api/state?since=" + since)).json();
@@ -1372,7 +1570,7 @@ async function poll() {
     if (samples.length && samples[0].host < cut)
       samples = samples.filter(s => s.host >= cut);
     status = d.status;
-    renderConn(d); renderCfg(d); renderTables(d);
+    renderConn(d); renderArchive(d.archive); renderCfg(d); renderTables(d);
   } catch (e) {
     const c = document.getElementById("conn");
     c.className = "warn";

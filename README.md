@@ -13,7 +13,7 @@ both displays it and drives it:
 | | |
 |---|---|
 | **Display** | Live readings, the last 200 samples, 30-minute plots of every variable |
-| **Control** | Start/stop logging, set location, set the clock, download and delete log files |
+| **Control** | Start/stop logging, set location, set the clock, download (one file or all of them) and delete log files |
 
 Logging does not need the host. Location and the autostart flag are persisted
 on the device, so a board configured at the bench can be unplugged and run on
@@ -132,7 +132,8 @@ from the dashboard — a run that is already going keeps going when the USB
 cable comes out.
 
 A run rolls over to a new file every hour, so a long deployment arrives as a
-row of hourly files rather than one that is slow to transfer.
+row of hourly files rather than one that is slow to transfer. **Download all**
+collects the whole row in one go — see *Downloading log files*.
 
 ---
 
@@ -328,6 +329,15 @@ It is not instant: expect a few seconds for a typical log, and longer for a
 large one. Sampling and logging continue throughout — the device paces itself
 between chunks so a download cannot starve the sensor.
 
+**Download all** does the same for every file on the device and saves them as
+a single `aq-logs-<date>-<time>.zip`. It asks the device for a fresh listing
+first, so a file opened since the dashboard last refreshed is included, and it
+transfers one file at a time — a full flash is minutes of serial, and the Log
+files card counts the files off as they arrive. Anything that will not
+transfer is left out rather than aborting the run: the zip then carries a
+`MISSING.txt` naming those files, and the dashboard says how many were
+skipped, so retry them individually with **Download**.
+
 ### Serial protocol
 
 `main.py` streams tagged JSON lines and accepts tagged JSON commands on the
@@ -412,7 +422,9 @@ flash fills up*.
 
 **A download fails with "transfer stalled" or "checksum mismatch".**
 Bytes were lost on the way. Nothing was written to disk — press Download
-again. Persistent failures usually mean a second reader on the port.
+again. Persistent failures usually mean a second reader on the port. After a
+**Download all**, the same failure shows as a file missing from the zip and
+named in its `MISSING.txt`.
 
 **`PCF8523 not responding at 0x68`.**
 Check wiring. Remember a DS3231 on the bus would answer at the same address.
