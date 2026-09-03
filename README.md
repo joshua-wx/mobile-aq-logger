@@ -70,6 +70,7 @@ of timekeeping accuracy.
 | [`pcf8523.py`](pcf8523.py) | PCF8523 RTC driver |
 | [`aq_bridge.py`](aq_bridge.py) | **Host-side.** Speaks the serial protocol and serves the dashboard |
 | [`log_aq.py`](log_aq.py) | Headless alternative to `main.py` — logs to CSV with no host interface at all |
+| [`postprocess.ipynb`](postprocess.ipynb) | **Host-side.** Merges a run's hourly CSVs onto one time axis and plots it |
 | [`test_sen65.py`](test_sen65.py) | Bench test: print sensor readings once a second |
 | [`test_pcf8523.py`](test_pcf8523.py) | Bench test: print the time; set it with `SET_TIME = True` |
 | [`boot.py`](boot.py) | MicroPython boot hook, currently all commented out |
@@ -259,6 +260,40 @@ ESP32 runs its clock off an RC oscillator that drifts by seconds per hour.
 A missing or faulty RTC does not stop the logger. Sampling continues, the
 dashboard reports the problem, and the CSV header flags the timestamps as
 unreliable.
+
+---
+
+## Postprocessing
+
+An hour per file keeps the device honest and each download small; it also means a
+day's run arrives as 24 files that all start their clock at zero.
+[`postprocess.ipynb`](postprocess.ipynb) puts them back together:
+
+```
+pip install -r requirements-analysis.txt
+jupyter lab postprocess.ipynb
+```
+
+Point `LOG_DIR` at the folder you unzipped the download into and run the notebook
+top to bottom. It recovers each file's start time, location and clock provenance
+from its header, turns `elapsed_s` back into absolute time, and merges everything
+onto **one continuous time axis** spanning the run.
+
+That axis is built from the cadence the run actually has rather than an assumed
+one. A row is written per sensor sample, and the SEN65 does not produce samples on
+a perfectly regular beat — a real run comes out around one every two seconds, with
+the spacing wandering by a second either way. The notebook measures the typical
+interval and treats only a much longer jump as the logger being off, so an hour it
+spent switched off is an explicit break every plot honours, while ordinary jitter
+is not mistaken for thousands of tiny outages. Set `SAMPLE_PERIOD` to a frequency
+like `"1s"` to force a regular grid instead.
+
+It reports the cadence, coverage and gaps, names any file whose `# Clock:` header
+the device flagged as unreliable, and draws the run: PM, an hour of PM2.5 zoomed to
+individual samples, the gas indices, a panel per variable, an hour-of-day profile
+and the distributions, with the WHO 24-hour guideline levels marked. The last cell
+writes the merged run out as a single `merged.csv` on that continuous axis, plus an
+hourly-mean copy small enough to mail.
 
 ---
 

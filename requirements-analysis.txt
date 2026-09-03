@@ -1,0 +1,5 @@
+# Host-side only, for postprocess.ipynb. Nothing here is installed on the ESP32,
+# and none of it is needed to run the logger or the dashboard.
+pandas>=2.0
+matplotlib>=3.7
+jupyterlab>=4.0

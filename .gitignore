@@ -2,6 +2,11 @@
 # commit a sample log, force it:  git add -f examples/sample.csv
 *.csv
 
+# Notebook working files. The figures and merged output postprocess.ipynb
+# writes are derived from the logs, not source.
+.ipynb_checkpoints/
+figures/
+
 # Python
 __pycache__/
 *.py[cod]
